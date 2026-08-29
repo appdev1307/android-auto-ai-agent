@@ -43,14 +43,14 @@ changed files instead of the whole tree.
 python -m retrieval.indexer --aosp-root /aosp --base --aosp-version aosp15
 
 # OEM tree that forks AOSP
-python -m retrieval.indexer --aosp-root /vinfast/tree \
-    --customer vinfast --project vf8 --since-upstream android-15.0.0_r1
+python -m retrieval.indexer --aosp-root /oem/tree \
+    --customer oem-a --project proj1 --since-upstream android-15.0.0_r1
 
 # OEM snapshot (no upstream history)
-python -m retrieval.indexer --aosp-root /vinfast/tree --customer vinfast --project vf8
+python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1
 
 # later, after a sync — only changed files
-python -m retrieval.indexer --aosp-root /vinfast/tree --customer vinfast --project vf8 --incremental
+python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1 --incremental
 ```
 
 > The agent does **not** fetch source. You clone/`repo sync` the tree yourself and point
@@ -72,7 +72,7 @@ python -m agent.main --aosp-root /aosp \
   --bug "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON"
 
 # with a customer overlay (tenant is explicit — never auto-picked)
-python -m agent.main --bug "..." --customer vinfast --project vf8 --aosp-version aosp15
+python -m agent.main --bug "..." --customer oem-a --project proj1 --aosp-version aosp15
 ```
 
 ---
@@ -130,8 +130,8 @@ Each customer/OEM gets a physically separate store; base AOSP is shared read-onl
 ```
 indexes/stores/
   _base/aosp15/            # shared AOSP, built once
-  vinfast/vf8/aosp15/      # isolated customer overlay
-  bosch/projX/aosp15/
+  oem-a/proj1/aosp15/      # isolated customer overlay
+  oem-b/proj2/aosp15/
 ```
 
 A session only ever loads `_base` + **one** customer store, so another customer's code is
