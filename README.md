@@ -4,7 +4,7 @@
 **Android 15 full stack**:
 
 `HMI → CarService → AIDL → VHAL → VSS`, ranked **customer/OEM-first** (`vendor/`, `device/`),
-with **physical IP isolation per customer** (multi-tenant, option B).
+with **physical IP isolation per customer**.
 
 Not a prompt-only skeleton. Includes:
 - Structural chunking + Chroma vector index + BM25 corpus
