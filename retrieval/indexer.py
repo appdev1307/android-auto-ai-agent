@@ -8,8 +8,8 @@ Examples:
     # base AOSP layer (shared, built once):
     python -m retrieval.indexer --aosp-root /aosp --base --aosp-version aosp15
     # a customer overlay:
-    python -m retrieval.indexer --aosp-root /vinfast/tree \
-        --customer vinfast --project vf8 --aosp-version aosp15
+    python -m retrieval.indexer --aosp-root /oem/tree \
+        --customer oem-a --project proj1 --aosp-version aosp15
 """
 
 from __future__ import annotations

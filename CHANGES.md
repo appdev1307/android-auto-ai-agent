@@ -188,5 +188,5 @@ Verified: an OEM edit to frameworks/base/.../PmTest.java (a *Test.java the filte
 drops) is force-indexed via --since-upstream android-15.0.0_r1.
 
 Usage:
-    python -m retrieval.indexer --aosp-root /oem/tree --customer vinfast --project vf8 \
+    python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1 \
         --since-upstream android-15.0.0_r1
