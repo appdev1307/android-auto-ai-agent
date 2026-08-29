@@ -4,7 +4,7 @@
 **Android 15 full stack**:
 
 `HMI → CarService → AIDL → VHAL → VSS`, ranked **customer/OEM-first** (`vendor/`, `device/`),
-with **physical IP isolation per customer**.
+with **physical IP isolation per customer** (multi-tenant, option B).
 
 Not a prompt-only skeleton. Includes:
 - Structural chunking + Chroma vector index + BM25 corpus
@@ -29,32 +29,26 @@ pip install -r requirements.txt
 
 ## 2. Index a source tree (one command per tree)
 
-Fresh AOSP from Google → `--base` (aggressive filter: drops prebuilts/test/external).
-OEM tree from your org's git → `--customer <oem> --project <p>` (keeps almost everything,
-since it's all patches/IP worth indexing); **add** `--since-upstream <tag>` when that tree
-forks AOSP and shares git history — it force-indexes the exact files the OEM patched inside
-`frameworks/base` that the normal filter would miss. Detached snapshot with no upstream
-history → drop `--since-upstream` (`--customer` mode already keeps everything). Both write
-the git SHA to the store manifest, so next time add `--incremental` to re-index only the
-changed files instead of the whole tree.
+**You fetch the source, the tool never does.** Clone/`repo sync`/export the tree yourself
+(fresh AOSP, or a customer-specific tree from your org's git) however your workflow does it,
+then point `--aosp-root` at it. The indexer only reads that path and indexes it; the agent
+uses the resulting store.
+
+Fresh AOSP → `--base` (aggressive filter: drops prebuilts/test/external). Customer tree →
+`--customer <oem> --project <p>` (keeps almost everything, since it's all patches/IP worth
+indexing). Both write the git SHA to the store manifest, so after you re-sync a tree, add
+`--incremental` to re-index only the changed files instead of the whole tree.
 
 ```bash
-# fresh AOSP (shared base, once)
+# fresh AOSP (shared base, built once)
 python -m retrieval.indexer --aosp-root /aosp --base --aosp-version aosp15
 
-# OEM tree that forks AOSP
-python -m retrieval.indexer --aosp-root /oem/tree \
-    --customer oem-a --project proj1 --since-upstream android-15.0.0_r1
-
-# OEM snapshot (no upstream history)
+# a customer tree you fetched
 python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1
 
-# later, after a sync — only changed files
+# later, after you re-sync that tree — only changed files
 python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1 --incremental
 ```
-
-> The agent does **not** fetch source. You clone/`repo sync` the tree yourself and point
-> `--aosp-root` at it; the indexer only reads and indexes.
 
 ## 3. Start vLLM
 
@@ -105,11 +99,9 @@ Four layers wired through `AgentState`: **graph** (LangGraph orchestration), **t
 ### Index filter & incremental (`retrieval/chunker.py`, `indexer.py`)
 
 - `should_index(path, mode)` — `base` mode drops prebuilts/test/external/generated/oversized;
-  `customer` mode keeps almost everything (OEM patches land anywhere).
-- `--since-upstream <tag>` — force-index every file the OEM patched vs an upstream ref,
-  bypassing the filter (the only reliable way to catch edits inside `frameworks/base`).
+  `customer` mode keeps almost everything (customer patches land anywhere).
 - `--incremental` — `git diff` the tree's HEAD against the last indexed SHA and touch only
-  changed/added/deleted files in both Chroma and BM25.
+  changed/added/deleted files in both Chroma and BM25 (pure local diff; no fetching).
 
 ### Tools (`agent/tools_def.py`)
 
