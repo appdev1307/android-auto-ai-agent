@@ -148,22 +148,3 @@ to root, embed-model mismatch raises.
 `data/config.yaml` — model endpoint, `stores_root`, index roots, embed model, ranking weights
 (`ce_blend`, `prior_customer`, `prior_customer_store`, `prior_hidl_penalty`), `max_tool_iters`,
 safety (`auto_apply: false`). Swap the embed model to a code-embedding model when you can afford it.
-
----
-
-## What this is / is not
-
-| Is | Is not |
-|----|--------|
-| Hybrid RAG (dense+BM25+exact) + tools + ReAct | Full AST / tree-sitter code graph |
-| Customer-first ranking, per-customer IP isolation | Auto-apply to production |
-| Full-stack path coverage, HIDL-aware | Patch validation / compile loop (planned) |
-| Forced human-review on safety-critical layers | Perfect SWE-bench agent |
-
----
-
-## Later: A15 integration agent
-
-Leave property/AIDL/VSS contracts explicit in patches. Hook additional tools under
-`agent/tools_def.py` when you ship the integration agent. Planned next: validator layer +
-`git apply --check` patch validation, and a small labeled smoke set for regression.
