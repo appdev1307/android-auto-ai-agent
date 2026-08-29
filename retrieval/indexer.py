@@ -1,7 +1,12 @@
 """Build a per-tenant knowledge store (Chroma + BM25 + manifest).
 
+This tool does NOT fetch source. You fetch the tree yourself (fresh AOSP, or a
+customer-specific tree from your org) however your workflow does it, then point
+`--aosp-root` at it. The indexer only reads that path, indexes it, and the agent
+uses the resulting store.
+
 Layout (physical isolation, option B):
-    <stores_root>/_base/<aosp_version>/           ← shared AOSP base
+    <stores_root>/_base/<aosp_version>/                  ← shared AOSP base
     <stores_root>/<customer>/<project>/<aosp_version>/   ← isolated customer overlay
 
 Examples:
@@ -10,6 +15,9 @@ Examples:
     # a customer overlay:
     python -m retrieval.indexer --aosp-root /oem/tree \
         --customer oem-a --project proj1 --aosp-version aosp15
+    # after you re-sync that tree, only re-index what changed:
+    python -m retrieval.indexer --aosp-root /oem/tree \
+        --customer oem-a --project proj1 --incremental
 """
 
 from __future__ import annotations
@@ -93,8 +101,7 @@ def _resolve_store_dir(rag: dict, *, base: bool, customer: str | None,
 def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
                 base: bool = False, customer: str | None = None,
                 project: str = "default", aosp_version: str = "aosp15",
-                reset: bool = False, incremental: bool = False,
-                since_upstream: str | None = None):
+                reset: bool = False, incremental: bool = False):
     cfg = load_config(config_path)
     rag = cfg["rag"]
     root = Path(aosp_root).resolve()
@@ -146,31 +153,6 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
             n += len(ids[sl])
         return n
 
-    # Files the OEM actually patched vs upstream — indexed UNCONDITIONALLY,
-    # bypassing the filter (an OEM edit in test/ or external/ still matters).
-    def oem_patched_files() -> list[Path]:
-        if not since_upstream:
-            return []
-        diff = _git_changed(root, since_upstream, new_sha or "HEAD")
-        if diff is None:
-            print(f"[since-upstream] cannot diff against '{since_upstream}' "
-                  f"(missing ref / shallow clone) — skipping OEM-patch union.")
-            return []
-        changed, _deleted = diff
-        # keep only files that still exist + are real source (ext + not binary),
-        # but SKIP the tier filter — that's the whole point.
-        out = []
-        for p in changed:
-            if p.exists() and p.suffix.lower() in CODE_EXTS and not is_hidl(str(p)):
-                try:
-                    if p.stat().st_size <= MAX_INDEX_FILE_BYTES:
-                        out.append(p)
-                except OSError:
-                    pass
-        print(f"[since-upstream] {len(out)} OEM-patched files force-indexed "
-              f"(vs {since_upstream})")
-        return out
-
     bm25_path = store_dir / "bm25_corpus.pkl"
     prev = StoreManifest.load(store_dir / "manifest.json")
     new_sha = _git_sha(root)
@@ -187,10 +169,7 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
 
     if do_incremental:
         changed, deleted = diff
-        # re-apply the tier filter, but always keep OEM-patched files
-        forced = {str(p.resolve()) for p in oem_patched_files()}
-        changed = [p for p in changed
-                   if should_index(p, mode=mode) or str(p.resolve()) in forced]
+        changed = [p for p in changed if should_index(p, mode=mode)]  # re-apply tier filter
         print(f"[incremental] {prev.git_sha[:8]}→{new_sha[:8]}  "
               f"changed={len(changed)} deleted={len(deleted)}")
 
@@ -230,8 +209,6 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
                 print(f"[skip missing] {b}")
         if not files:
             files = list(iter_files(root, mode=mode))
-        # UNION in OEM-patched files that the filter would otherwise drop
-        files.extend(oem_patched_files())
         uniq, seen = [], set()
         for f in files:
             k = str(f.resolve())
@@ -261,11 +238,7 @@ if __name__ == "__main__":
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--incremental", action="store_true",
                     help="only re-index files changed since the last indexed git SHA")
-    ap.add_argument("--since-upstream", default=None, metavar="TAG_OR_SHA",
-                    help="force-index every file the OEM patched vs this upstream ref "
-                         "(e.g. android-15.0.0_r1), bypassing the tier filter")
     args = ap.parse_args()
     build_index(args.aosp_root, args.config, base=args.base, customer=args.customer,
                 project=args.project, aosp_version=args.aosp_version,
-                reset=args.reset, incremental=args.incremental,
-                since_upstream=args.since_upstream)
+                reset=args.reset, incremental=args.incremental)

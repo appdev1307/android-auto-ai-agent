@@ -171,22 +171,28 @@ caught by directory-name rules at all.
 
 ## Two-tier should_index(path, mode)
 - `mode="base"` (AOSP upstream): aggressive filter, unchanged.
-- `mode="customer"` (OEM overlay): permissive — keeps test/external/generated,
+- `mode="customer"` (customer overlay): permissive — keeps test/external/generated,
   drops only hard junk (out/, .git, node_modules, binaries, oversized, HIDL).
 - `indexer.py` picks mode automatically: `--customer` → customer, `--base` → base.
 - `iter_files(..., mode=...)` threads it through.
-Verified: OEM files in tests/external/generated → dropped by base, KEPT by customer;
+Verified: customer files in tests/external/generated → dropped by base, KEPT by customer;
 build junk + HIDL → dropped by both.
 
-## --since-upstream <tag/sha> — the real fix for framework patches
-`git diff <upstream_ref> HEAD` → the exact files the OEM touched. Those are
-force-indexed UNCONDITIONALLY, bypassing the tier filter (only binary/oversized/
-HIDL still excluded). This is the only reliable way to catch an OEM edit inside
-frameworks/base — no directory rule can. Unioned into both full and incremental
-builds; falls back gracefully if the ref is missing (shallow clone).
-Verified: an OEM edit to frameworks/base/.../PmTest.java (a *Test.java the filter
-drops) is force-indexed via --since-upstream android-15.0.0_r1.
+(Note: an earlier `--since-upstream` flag was also added here, then removed in
+Update 5 — it blurred the tool/fetch boundary. `--customer` mode already keeps
+these files. See Update 5.)
 
-Usage:
-    python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1 \
-        --since-upstream android-15.0.0_r1
+---
+
+# Update 5 — Clarify boundary: the tool never fetches source
+
+Removed `--since-upstream` (and its `oem_patched_files` helper). It assumed an
+upstream ref / git history to diff against, which blurred the boundary: source
+fetching is entirely the user's job. You clone/sync/export any tree (fresh AOSP
+or a customer tree) however your workflow does it and point `--aosp-root` at it;
+the indexer only reads + indexes, the agent only uses the store. No network,
+no remotes.
+
+Kept: `--base` / `--customer` tier filter and `--incremental` (a pure LOCAL
+`git diff` between two SHAs already in the tree you provided — not a fetch).
+README + indexer docstring updated to state the boundary explicitly.
