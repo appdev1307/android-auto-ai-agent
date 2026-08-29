@@ -24,33 +24,48 @@ Not a prompt-only skeleton. Includes:
 cd android-auto-ai-agent
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-# system dependency: ripgrep (rg)
+# system dependency: ripgrep (rg), and Google's `repo` tool for step 2
 ```
 
-## 2. Index a source tree (one command per tree)
+## 2. Get the AOSP source (fresh Android 15 from Google)
 
-**You fetch the source, the tool never does.** Clone/`repo sync`/export the tree yourself
-(fresh AOSP, or a customer-specific tree from your org's git) however your workflow does it,
-then point `--aosp-root` at it. The indexer only reads that path and indexes it; the agent
-uses the resulting store.
-
-Fresh AOSP → `--base` (aggressive filter: drops prebuilts/test/external). Customer tree →
-`--customer <oem> --project <p>` (keeps almost everything, since it's all patches/IP worth
-indexing). Both write the git SHA to the store manifest, so after you re-sync a tree, add
-`--incremental` to re-index only the changed files instead of the whole tree.
+The agent does **not** fetch source — you download AOSP with Google's `repo` tool, then
+point the indexer at it.
 
 ```bash
-# fresh AOSP (shared base, built once)
-python -m retrieval.indexer --aosp-root /aosp --base --aosp-version aosp15
+# install repo (once)
+mkdir -p ~/bin && curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+chmod a+x ~/bin/repo && export PATH=~/bin:$PATH
 
-# a customer tree you fetched
-python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1
-
-# later, after you re-sync that tree — only changed files
-python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1 --incremental
+# fresh Android 15 checkout
+mkdir -p ~/aosp15 && cd ~/aosp15
+repo init -u https://android.googlesource.com/platform/manifest -b android-15.0.0_r1
+repo sync -c -j8           # -c: current branch only; full tree ~150 GB, takes hours
+export AOSP_ROOT=~/aosp15
 ```
 
-## 3. Start vLLM
+To save disk/time you can sync only the automotive-relevant projects instead of the full tree:
+
+```bash
+repo sync -c -j8 packages/services/Car hardware/interfaces frameworks/base
+```
+
+## 3. Build the RAG index
+
+Index the tree you fetched (the aggressive filter drops prebuilts/test/external, so a full
+tree is fine):
+
+```bash
+python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --aosp-version aosp15
+```
+
+After a later `repo sync`, re-index only what changed:
+
+```bash
+python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --aosp-version aosp15 --incremental
+```
+
+## 4. Start vLLM
 
 ```bash
 bash scripts/start_vllm.sh
@@ -58,16 +73,15 @@ export OPENAI_API_BASE=http://127.0.0.1:8000/v1
 export OPENAI_API_KEY=dummy
 ```
 
-## 4. Run the agent
+## 5. Run the agent
 
 ```bash
-# base-only knowledge
-python -m agent.main --aosp-root /aosp \
+python -m agent.main --aosp-root $AOSP_ROOT --aosp-version aosp15 \
   --bug "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON"
-
-# with a customer overlay (tenant is explicit — never auto-picked)
-python -m agent.main --bug "..." --customer oem-a --project proj1 --aosp-version aosp15
 ```
+
+Output: ranked candidate files (by layer), a root-cause hypothesis, a proposed unified
+diff (or N/A), and a `needs_human_review` flag.
 
 ---
 
@@ -124,6 +138,14 @@ indexes/stores/
   _base/aosp15/            # shared AOSP, built once
   oem-a/proj1/aosp15/      # isolated customer overlay
   oem-b/proj2/aosp15/
+```
+
+Index a customer tree you fetched, then run the agent against it:
+
+```bash
+python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1
+python -m agent.main --bug "..." --customer oem-a --project proj1 --aosp-version aosp15
+# omit --customer => base-only knowledge
 ```
 
 A session only ever loads `_base` + **one** customer store, so another customer's code is
