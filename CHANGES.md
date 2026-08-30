@@ -257,3 +257,19 @@ REAL file:
 
 Chain now: retrieve → localize → **full-file-grounded diff** → **diff validated vs folder**
 → human review. Prompt updated: first-pass diff is explicitly a "draft".
+
+---
+
+# Update 9 — Labeled eval harness (#3) + README
+
+New `eval/` module — you supply labels, it scores the agent:
+- `eval/run_eval.py` — runs the agent on each labeled bug and computes recall@k, MRR,
+  diff_validated_rate, and (with gold_diff_files) patch_file_hit_rate. Writes results.json.
+- `eval/labels.example.jsonl` — label schema: {id, bug, logcat?, gold_files, gold_diff_files?}.
+- Scoring uses suffix path-matching so short vs full paths still match; localization
+  ranks parsed from the agent's `N. <path> [layer]` output.
+- Labels are the user's to provide — gold_files come cheapest from real fix commits.
+README gains an Evaluation section.
+
+This is the ground truth every later improvement (prompt / model / LoRA / DSPy) is measured
+against — without it, "better" is a guess.

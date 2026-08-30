@@ -103,6 +103,30 @@ python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --scope framework
 Add or edit presets in config — no code change. `automotive` alone is **not** full-stack
 (no `frameworks/base`); use `framework` or `full` when a bug crosses into the platform.
 
+## Evaluation (labeled)
+
+Measure the agent instead of guessing. You provide labels (bug → gold files); the harness
+runs the agent and scores it. Label file is JSONL — see `eval/labels.example.jsonl`:
+
+```json
+{"id":"bug-001","bug":"...","gold_files":["path/a.java","path/b.yaml"],"gold_diff_files":["path/a.java"]}
+```
+
+Run:
+
+```bash
+python -m eval.run_eval --labels eval/labels.jsonl --aosp-root $AOSP_ROOT \
+    --customer oem-a --project proj1 --k 5 --out eval/results.json
+```
+
+Metrics: **recall@k** and **MRR** (localization), **diff_validated_rate** (fraction whose
+grounded diff matched the real file), and — if you supply `gold_diff_files` —
+**patch_file_hit_rate**. `gold_files` come cheapest from real fix commits in your tree's git
+history (the files the fix touched). Start with 10–15 bugs; it's the ground truth every
+later improvement (prompt, model, LoRA) is measured against.
+
+---
+
 ## Run on Colab (dev phase, no server)
 
 For development you don't need a server or the full 150 GB tree. Index the automotive
