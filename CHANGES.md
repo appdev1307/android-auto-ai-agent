@@ -292,3 +292,14 @@ User can add their own knowledge by dropping `*.md` into `hints/`:
 - `hints/HOWTO.txt` (ignored — not .md) + `hints/example-hint.md.example` template.
 Verified: `*.md` auto-load in filename order; `.txt`/`.example` ignored. Restart to apply.
 README documents both.
+
+---
+
+# Update 11 — Related work section (README)
+
+Documented surveyed papers: agentic RAG localization (BLAgent, Reformulate-Retrieve-
+Localize, BugCerberus, RepairAgent, CoSIL, SWE-bench) and LLM+automotive/VSS/VHAL
+(Automotive hallucination case study, Secure Multifaceted-RAG, ADAS event-chain codegen,
+RAG for vehicle design). Stated the gap: agentic hybrid-RAG localization on full-stack
+AAOS + OEM-first + per-customer IP isolation is underexplored. Natural baselines: BLAgent,
+BugCerberus (localization); Secure Multifaceted-RAG (isolation design).

@@ -103,6 +103,42 @@ python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --scope framework
 Add or edit presets in config — no code change. `automotive` alone is **not** full-stack
 (no `frameworks/base`); use `framework` or `full` when a bug crosses into the platform.
 
+## Related work
+
+The **technique** (agentic RAG for bug localization) is an active area; the **domain**
+(LLM + VHAL/VSS automotive) is studied separately; their **intersection on the full AAOS
+stack with OEM-first ranking + per-customer IP isolation** is where this project sits.
+
+Agentic RAG / bug localization:
+- **BLAgent: Agentic RAG for File-Level Bug Localization** (2026) — closest on technique:
+  AST-based, path-augmented chunking + multi-perspective queries; argues static RAG lacks
+  the reasoning to localize accurately. arXiv:2605.17965
+- **Reformulate, Retrieve, Localize** (Caumartin & Melo) — a non-fine-tuned LLM reformulates
+  queries over BM25, +35% first-file ranking vs. BM25 baseline. arXiv:2512.07022
+- **Bridging Bug Localization and Issue Fixing (BugCerberus)** (TSE 2026) — hierarchical
+  localize→fix; baselines RAG(BM25), Agentless(GPT-4o), FBL-BERT. arXiv:2502.15292
+- Related agents: RepairAgent (2403.17134), CoSIL (2503.22424), SWE-bench (ICLR 2024).
+
+LLM + automotive / VSS / VHAL:
+- **Hallucination in LLM-Based Code Generation: An Automotive Case Study** (2025) — COVESA
+  VSS signals as prompt input, measures hallucination; directly relevant to VSS naming +
+  path-hallucination. arXiv:2508.11257
+- **Secure Multifaceted-RAG for Enterprise** (2025) — closest on architecture: hybrid
+  retrieval + confidentiality filtering + a local fine-tuned Qwen-2.5 for an automotive
+  domain; overlaps our IP-isolation + customer-first + local model. arXiv:2504.13425
+- **LLM-Empowered Event-Chain Code Generation for ADAS in SDV** (2025) — VSS comAPI-driven
+  automotive code generation. arXiv:2511.21877
+- **Adopting RAG for LLM-Aided Future Vehicle Design** (2024) — RAG + local LLMs, automotive
+  privacy motivation. arXiv:2411.09590
+
+**Gap addressed here**: agentic hybrid-RAG localization on the *full-stack AAOS/AOSP tree*
+(HMI→CarService→AIDL→VHAL→VSS), ranked customer/OEM-first, HIDL-aware, with physical
+per-customer IP isolation. The technique is not new; this specific domain application is
+underexplored. BLAgent and BugCerberus are the natural localization baselines; Secure
+Multifaceted-RAG is the natural comparison for the isolation design.
+
+---
+
 ## Custom hints (add your own knowledge, no code edit)
 
 The agent's diagnostic playbook lives in `skills/android_automotive.md` (symptom→layer,
