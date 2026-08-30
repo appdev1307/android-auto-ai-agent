@@ -218,3 +218,42 @@ ceiling the thesis hit with DSPy/MIPROv2). Fixed 4 correctness bugs, no added co
 
 Not changed: the real levers for patch quality (full-file context + `git apply --check`
 validation loop + labeled eval) are architecture, not prompt.
+
+---
+
+# Update 7 — Diff validation against the downloaded folder (no git)
+
+The agent only READS the downloaded source folder and never applies patches, so git is
+not needed. What's needed is confirming the model's diff actually matches the real files
+— to catch fabricated diffs (invented line content / wrong version).
+
+`validate_diffs(text, read_file)` in `nodes.py` (pure Python):
+- parses each unified-diff hunk, takes its "before" side (context + removed lines),
+- reads the target file from `aosp_root` and checks that block actually exists there,
+- flags: missing target file, or hunk context that doesn't match the real file.
+
+`finalize` runs it whenever the output contains a diff; on any problem it appends a
+warning and forces `needs_human_review = True` (a non-applying diff must not be trusted).
+Verified: a real diff passes; a fabricated hunk and a missing-file diff are both flagged.
+
+Replaces the earlier "git apply --check" idea — same goal (catch bad diffs), but works on
+a plain read-only folder with no VCS dependency.
+
+---
+
+# Update 8 — Full-file context for patch generation (#1)
+
+The first finalize pass drafts a diff from ~1200-char chunks, so its context lines are
+usually wrong and the diff won't apply. Added a second pass that grounds the patch in the
+REAL file:
+
+- After localization, if the draft output contains a diff and the top candidate exists,
+  read that file's FULL content from `aosp_root` (bounded to one file / ~24k chars so it
+  fits the 16k model context) and ask the model to output a unified diff that applies
+  cleanly against it. The grounded diff is appended as `## Patch (grounded in full file)`.
+- `validate_diffs` (Update 7) then runs on the grounded diff.
+- **Index-only mode** (source not mounted): the full-file pass is skipped and the draft is
+  flagged "not grounded — verify manually", forcing human review.
+
+Chain now: retrieve → localize → **full-file-grounded diff** → **diff validated vs folder**
+→ human review. Prompt updated: first-pass diff is explicitly a "draft".

@@ -111,13 +111,78 @@ def _extract_candidate_paths(text: str) -> list[str]:
     return re.findall(r"(?:^|\s)((?:[\w.\-]+/){1,}[\w.\-]+\.\w+)", text)
 
 
+def _norm(s: str) -> str:
+    # compare ignoring leading/trailing whitespace (indent noise from the model)
+    return s.strip()
+
+
+def validate_diffs(text: str, read_file) -> list[str]:
+    """Check every unified-diff hunk against the REAL file in the downloaded folder.
+
+    No git needed — we only read files. For each hunk we take its "before" side
+    (context ' ' + removed '-' lines) and confirm that exact sequence exists in
+    the target file. A fabricated diff (invented line content) won't match.
+
+    Returns a list of human-readable problems; empty means all diffs check out.
+    """
+    problems: list[str] = []
+    cur_path = None
+    before: list[str] = []          # before-side lines of the current hunk
+    in_hunk = False
+
+    def check(path, before_lines):
+        if not path or not before_lines:
+            return
+        content = read_file(path, max_chars=200_000)
+        if content.startswith("[error") or content.startswith("[refused"):
+            problems.append(f"{path}: target file not found in the source folder")
+            return
+        file_lines = [_norm(l) for l in content.splitlines()]
+        want = [_norm(l) for l in before_lines if _norm(l) != ""]
+        if not want:
+            return
+        # find the first `want` line, then require the rest to follow in order
+        joined = "\n".join(file_lines)
+        block = "\n".join(want)
+        if block not in joined:
+            problems.append(
+                f"{path}: hunk context does not match the real file "
+                f"(diff may be fabricated / against a different version)")
+
+    for line in text.splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            # new file target — flush previous hunk
+            if in_hunk:
+                check(cur_path, before); before = []; in_hunk = False
+            m = re.search(r"[ab]/(\S+)", line) or re.search(r"\+\+\+ (\S+)", line)
+            if m:
+                cur_path = m.group(1)
+            continue
+        if line.startswith("@@"):
+            if in_hunk:
+                check(cur_path, before)
+            before = []; in_hunk = True
+            continue
+        if in_hunk:
+            if line.startswith(" ") or line.startswith("-"):
+                before.append(line[1:])
+            elif line.startswith("+"):
+                pass  # added lines aren't in the original
+            else:
+                check(cur_path, before); before = []; in_hunk = False
+    if in_hunk:
+        check(cur_path, before)
+    return problems
+
+
 def finalize(state: AgentState) -> Dict[str, Any]:
     """Ask model for final structured summary without new tools."""
     summary_prompt = HumanMessage(content="""Finalize now. No more tools.
 Provide:
-## Candidate files (ranked)
-## Root cause
-## Proposed patches (unified diff only) or N/A
+## Candidate files (ranked)   — one per line as `N. <full/path> [layer]`, only files seen in tool results
+## Root cause                 — grounded in retrieved snippets
+## Proposed patch (draft)     — unified diff if a code fix is warranted, else N/A
+                                (a full-file-grounded diff is generated automatically after this)
 ## Unit test ideas
 ## needs_human_review: true/false
 """)
@@ -145,6 +210,45 @@ Provide:
     if unverified:
         text += "\n\n> ⚠ Unverified paths (not found in tree, possible hallucination): " \
                 + ", ".join(unverified)
+
+    # --- #1 Full-file context: regenerate the diff against the REAL full file ---
+    # The first pass drafts a diff from ~1200-char chunks, so its context lines
+    # are often wrong. If it proposed a diff, feed the top candidate's FULL
+    # content and ask for a diff that applies cleanly against it. Bounded to one
+    # file / ~24k chars so it fits the model's context window.
+    if r is not None and "@@" in text and verified:
+        if getattr(r, "source_present", True):
+            top = verified[0]
+            full = r.read_file(top, max_chars=24000)
+            if not full.startswith("[error") and not full.startswith("[refused"):
+                trunc = "\n... [file truncated at 24000 chars] ..." if len(full) >= 24000 else ""
+                refine_msgs = [
+                    SystemMessage(content=SYSTEM),
+                    HumanMessage(content=f"Bug:\n{state.get('bug_report','')}\n\n"
+                                         f"Root-cause summary:\n{text[:1500]}"),
+                    HumanMessage(content=(
+                        f"Full current content of `{top}` below. Output ONLY a unified diff "
+                        f"that applies CLEANLY against this exact file (real context lines, "
+                        f"correct path), or `N/A` if no change is warranted.\n\n"
+                        f"```\n{full}{trunc}\n```")),
+                ]
+                patch = llm.invoke(refine_msgs)
+                patch_text = patch.content if isinstance(patch.content, str) else str(patch.content)
+                text += "\n\n## Patch (grounded in full file: " + top + ")\n" + patch_text
+        else:
+            text += "\n\n> ⚠ Patch not grounded: source folder not mounted (index-only " \
+                    "mode). The draft diff above is from partial chunks — verify manually."
+            needs_review = True
+
+    # Diff grounding: check each patch hunk against the real file in the folder.
+    diff_problems = []
+    if r is not None and ("@@" in text or "--- " in text):
+        diff_problems = validate_diffs(text, r.read_file)
+        if diff_problems:
+            text += "\n\n> ⚠ Diff did not validate against the source folder:\n>   - " \
+                    + "\n>   - ".join(diff_problems) \
+                    + "\n> Treat the patch as a described change, not an apply-ready diff."
+            needs_review = True   # a non-applying diff must not be trusted
 
     return {
         "messages": [AIMessage(content=text)],
