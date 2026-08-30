@@ -103,6 +103,32 @@ python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --scope framework
 Add or edit presets in config — no code change. `automotive` alone is **not** full-stack
 (no `frameworks/base`); use `framework` or `full` when a bug crosses into the platform.
 
+## Custom hints (add your own knowledge, no code edit)
+
+The agent's diagnostic playbook lives in `skills/android_automotive.md` (symptom→layer,
+trace strategy, common suspects). To add your **own** project knowledge — known-flaky
+modules, OEM naming, "signal X maps via file Y" — drop a `*.md` file into `hints/`:
+
+```
+hints/
+  10-power-bugs.md      # your notes; auto-appended to the system prompt
+  20-vss-mapping.md
+```
+
+Files load in filename order (prefix `00-`, `10-`, …). Restart to pick up changes. See
+`hints/HOWTO.txt`. You can also point elsewhere via `data/config.yaml`:
+
+```yaml
+prompt:
+  hints_dir: "hints"
+  hint_files: ["path/to/extra.md"]
+```
+
+Hints steer the model's *reasoning*; they don't replace retrieval — if the evidence
+doesn't contain the right file, a hint won't conjure it.
+
+---
+
 ## Evaluation (labeled)
 
 Measure the agent instead of guessing. You provide labels (bug → gold files); the harness

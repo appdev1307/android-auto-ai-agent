@@ -28,6 +28,28 @@ def load_text(rel: str) -> str:
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
+def load_hints() -> str:
+    """Custom operator hints — no code edit needed to add them.
+
+    Drop any `*.md` file into the `hints/` folder (path configurable via
+    `prompt.hints_dir`), and/or list explicit files in `prompt.hint_files`.
+    All are appended to the system prompt, sorted by filename so you can order
+    them (e.g. 00-power.md, 10-vss.md). Restart the process to pick up changes.
+    """
+    root = Path(__file__).resolve().parents[1]
+    prompt_cfg = CFG.get("prompt", {}) or {}
+    parts: list[str] = []
+    hints_dir = root / prompt_cfg.get("hints_dir", "hints")
+    if hints_dir.is_dir():
+        for f in sorted(hints_dir.glob("*.md")):
+            parts.append(f.read_text(encoding="utf-8"))
+    for rel in prompt_cfg.get("hint_files", []) or []:
+        parts.append(load_text(rel))
+    if not parts:
+        return ""
+    return "\n\n# Operator hints (custom)\n" + "\n\n".join(parts)
+
+
 CFG = load_config()
 MODEL = CFG.get("model", {})
 API_BASE = MODEL.get("api_base") or os.environ.get("OPENAI_API_BASE")
@@ -47,6 +69,7 @@ llm_with_tools = llm.bind_tools(ALL_TOOLS)
 SYSTEM = load_text("prompts/system.md") + "\n\n" + load_text("prompts/fewshot_localize.md")
 SYSTEM += "\n\n" + load_text("skills/AGENTS.md")
 SYSTEM += "\n\n" + load_text("skills/android_automotive.md")
+SYSTEM += load_hints()   # custom hints from hints/*.md + config prompt.hint_files
 
 
 # Build the retriever once per root and reuse it. Rebuilding on every graph

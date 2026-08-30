@@ -273,3 +273,22 @@ README gains an Evaluation section.
 
 This is the ground truth every later improvement (prompt / model / LoRA / DSPy) is measured
 against — without it, "better" is a guess.
+
+---
+
+# Update 10 — Diagnostic playbook + custom-hints mechanism
+
+## Diagnostic playbook (skills/android_automotive.md)
+Prompt told the model WHAT to output but not HOW to diagnose. Added a 5-step playbook:
+symptom→layer map (logcat signatures), trace-the-data-path strategy, symptom→common-suspect
+table, boundary-bug guidance (VSS↔VHAL/AIDL seams), and AOSP-vs-customer decision. Loaded
+via SYSTEM like the other skills.
+
+## Custom hints — no code edit (nodes.py load_hints + hints/)
+User can add their own knowledge by dropping `*.md` into `hints/`:
+- `load_hints()` globs `hints/*.md` (sorted) + optional `prompt.hint_files` from config,
+  appends them to SYSTEM under an "Operator hints (custom)" header.
+- `data/config.yaml` gains a `prompt:` block (`hints_dir`, `hint_files`).
+- `hints/HOWTO.txt` (ignored — not .md) + `hints/example-hint.md.example` template.
+Verified: `*.md` auto-load in filename order; `.txt`/`.example` ignored. Restart to apply.
+README documents both.

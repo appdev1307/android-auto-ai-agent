@@ -1,0 +1,15 @@
+Custom hints — how to add your own knowledge to the agent WITHOUT touching code.
+
+1. Drop a Markdown file here, e.g.  hints/10-power-bugs.md
+2. Write whatever guidance helps localization: symptom→file maps, known-flaky
+   modules, your team's naming conventions, project-specific gotchas, etc.
+3. Restart the agent (re-run). It's auto-appended to the system prompt.
+
+Notes:
+- Only *.md files are loaded. This HOWTO.txt is ignored (not .md).
+- Files load in filename order — prefix with 00-, 10-, 20- to control ordering.
+- You can also list explicit files in data/config.yaml under:
+      prompt:
+        hints_dir: "hints"        # folder scanned for *.md (default)
+        hint_files: ["path/to/extra.md"]
+- Rename example-hint.md.example -> example-hint.md to activate the sample.

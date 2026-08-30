@@ -1,0 +1,8 @@
+# Project hint: OEM speed pipeline
+
+- Vehicle.Speed on this project maps via vendor/oem/vss/mapping/speed.yaml, not the
+  AOSP default. Check that file first for any speed-related signal bug.
+- The OEM cluster app is com.oem.car.cluster; NPEs there are usually null areaId
+  on single-display variants.
+- After suspend/resume, CarPropertyService listeners are re-registered in
+  OemPowerPolicyHandler — a common miss for "value frozen after ignition" bugs.

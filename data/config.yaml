@@ -94,3 +94,7 @@ safety:
 
 logging:
   level: INFO
+
+prompt:
+  hints_dir: "hints"        # folder scanned for custom *.md hints
+  hint_files: []            # extra explicit hint files (optional)
