@@ -265,7 +265,89 @@ def _ast_chunks(path: Path, text: str, chunk_size: int, overlap: int) -> list[di
     return chunks
 
 
-# ── VSS signal-tree chunking (yaml/json) ─────────────────────────
+# ── Syntax oracle: tree-sitter parse-check (Update: real parser, not guessing) ──
+# Detect syntax errors by PARSING with tree-sitter and looking for ERROR /
+# MISSING nodes — the C4 "validate" step done with a real parser instead of
+# regex/LLM guessing. Used to check that a generated patch keeps the file
+# syntactically valid before it's ever shipped to a real build.
+
+def _first_error(node, src: bytes, limit: int = 5) -> list[str]:
+    """Return up to `limit` 'line N: <snippet>' for ERROR/MISSING nodes."""
+    errs: list[str] = []
+    stack = [node]
+    while stack and len(errs) < limit:
+        n = stack.pop()
+        if n.type == "ERROR" or n.is_missing:
+            line = n.start_point[0] + 1
+            snippet = src[n.start_byte:min(n.end_byte, n.start_byte + 60)].decode("utf-8", "ignore")
+            errs.append(f"line {line}: {('MISSING ' if n.is_missing else 'ERROR ')}{snippet!r}")
+        stack.extend(n.children)
+    return errs
+
+
+def parse_ok(text: str, suffix: str) -> tuple[bool, list[str]]:
+    """(is_valid, problems). If the language has no grammar, returns (True, [])
+    — we can't judge, so we don't block (a real build will catch the rest)."""
+    lang = _AST_LANG.get(suffix.lower())
+    parser = _get_parser(lang) if lang else None
+    if parser is None:
+        return True, []
+    try:
+        tree = parser.parse(bytes(text, "utf-8"))
+    except Exception as e:
+        return False, [f"parser failed: {e}"]
+    errs = _first_error(tree.root_node, text.encode("utf-8"))
+    return (len(errs) == 0), errs
+
+
+def apply_unified_diff(original: str, diff_text: str) -> str | None:
+    """Apply a unified diff to `original` in memory (no git, no disk).
+    Returns the patched text, or None if a hunk's context doesn't match."""
+    orig = original.splitlines()
+    out: list[str] = []
+    i = 0  # index into orig
+    lines = diff_text.splitlines()
+    k = 0
+    saw_hunk = False
+    while k < len(lines):
+        ln = lines[k]
+        if ln.startswith("@@"):
+            saw_hunk = True
+            m = re.search(r"@@ -(\d+)(?:,(\d+))? \+", ln)
+            if not m:
+                return None
+            start = int(m.group(1)) - 1
+            if start < 0:
+                start = 0
+            out.extend(orig[i:start])  # copy unchanged lines up to the hunk
+            i = start
+            k += 1
+            while k < len(lines) and not lines[k].startswith("@@") \
+                    and not lines[k].startswith("--- ") and not lines[k].startswith("+++ "):
+                h = lines[k]
+                if h.startswith("+"):
+                    out.append(h[1:])
+                elif h.startswith("-"):
+                    if i >= len(orig) or orig[i].strip() != h[1:].strip():
+                        return None  # context mismatch → can't apply
+                    i += 1
+                elif h.startswith(" ") or h == "":
+                    ctx = h[1:] if h.startswith(" ") else h
+                    if i < len(orig):
+                        if ctx.strip() and orig[i].strip() != ctx.strip():
+                            return None  # context line doesn't match the real file
+                        out.append(orig[i]); i += 1
+                    else:
+                        out.append(ctx)
+                k += 1
+        else:
+            k += 1
+    if not saw_hunk:
+        return None
+    out.extend(orig[i:])  # trailing unchanged lines
+    return "\n".join(out)
+
+
 # VSS catalogs are hierarchical DATA, not code — chunk them by signal, one leaf
 # per chunk, keyed by the full dotted path (Vehicle.Cabin.Seat.Row1.Position).
 # Unwraps the "children" wrapper so paths are clean (the labelling bug the thesis

@@ -77,6 +77,7 @@ rag:
 
 agent:
   max_tool_iters: 8          # hard cap on ReAct tool loops before finalize
+  patch_max_tries: 2         # generate->parse-check->regenerate retries for the patch
 
 stack:
   target_android: 15

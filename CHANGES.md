@@ -345,3 +345,31 @@ and any failure → regex fallback. `requirements.txt`: + tree-sitter-kotlin.
 
 Verified: Kotlin method-level chunks; VSS per-signal chunks with clean dotted paths (no
 CHILDREN); Java/C++ intact.
+
+---
+
+# Update 14 — Syntax oracle: tree-sitter parse-check + generate→regenerate loop
+
+C4-done-right: validate generated patches with a REAL parser, not regex/LLM guessing.
+
+`retrieval/chunker.py`:
+- `parse_ok(text, suffix)` — parses with tree-sitter, returns (valid, [errors]) by
+  detecting ERROR / MISSING nodes. Unknown languages → (True,[]) (don't block; the real
+  build catches the rest).
+- `apply_unified_diff(original, diff)` — applies a diff in memory (no git/disk), validating
+  both removed AND context lines; returns None on any context mismatch.
+
+`agent/nodes.py`:
+- `_grounded_patch_loop()` — generate a diff → apply it to the real full file in memory →
+  parse-check the result → on a syntax error or apply-failure, feed the CONCRETE problem
+  back and regenerate (up to `agent.patch_max_tries`, default 2). Returns the best patch +
+  a note (forces human review) if it still fails after retries.
+- Wired into finalize's full-file patch pass, replacing the single-shot generation.
+
+Difference from thesis C4: the oracle is tree-sitter (a real parser) with concrete
+line-level feedback, so the loop actually converges instead of regenerating blindly.
+Verified: a broken diff (`int y = ;`) is caught by parse-check, fed back, and the retry
+produces a clean, parsing diff.
+
+Intended use: produce the syntactically cleanest diff possible before a full build; final
+compile/link validation still happens on the real Android source tree (e.g. on GCP).

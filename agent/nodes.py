@@ -15,6 +15,7 @@ from agent.state import AgentState
 from agent.tools_def import ALL_TOOLS, set_retriever
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
+from retrieval.chunker import apply_unified_diff, parse_ok
 
 
 def load_config() -> dict:
@@ -198,6 +199,60 @@ def validate_diffs(text: str, read_file) -> list[str]:
     return problems
 
 
+def _extract_first_diff(text: str) -> str:
+    """Pull the unified-diff block out of an LLM answer (handles ``` fences)."""
+    m = re.search(r"(--- [ab]?/?\S+.*?)(?:\n```|\Z)", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text if "@@" in text else ""
+
+
+PATCH_MAX_TRIES = int(CFG.get("agent", {}).get("patch_max_tries", 2))
+
+
+def _grounded_patch_loop(full: str, top: str, bug: str, summary: str) -> tuple[str, str]:
+    """Generate a unified diff, apply it in-memory to the real file, parse-check
+    the result with tree-sitter, and on any syntax/apply error feed the concrete
+    problem back and regenerate (up to patch_max_tries). This is the C4
+    generate→validate→regenerate loop with a REAL parser as the oracle instead
+    of regex/LLM guessing.
+
+    Returns (patch_text, note). note is '' when the patch applies cleanly and
+    parses; otherwise it explains the remaining problem (and review is forced).
+    """
+    from pathlib import Path as _P
+    suffix = _P(top).suffix
+    trunc = "\n... [truncated] ..." if len(full) >= 24000 else ""
+    last_err = None
+    patch_text = "N/A"
+    for _ in range(PATCH_MAX_TRIES + 1):
+        instr = (f"Full current content of `{top}` below. Output ONLY a unified diff that "
+                 f"applies CLEANLY against this exact file (real context lines, correct path), "
+                 f"or `N/A` if no change is warranted.")
+        if last_err:
+            instr += f"\n\nYour previous diff was rejected: {last_err}\nProduce a corrected diff."
+        msgs = [
+            SystemMessage(content=SYSTEM),
+            HumanMessage(content=f"Bug:\n{bug}\n\nRoot-cause summary:\n{summary}"),
+            HumanMessage(content=f"{instr}\n\n```\n{full}{trunc}\n```"),
+        ]
+        resp = llm.invoke(msgs)
+        patch_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        if "@@" not in patch_text:
+            return patch_text, ""  # model decided no change (N/A)
+        diff = _extract_first_diff(patch_text)
+        patched = apply_unified_diff(full, diff)
+        if patched is None:
+            last_err = "the diff did not apply (a hunk's context did not match the file)."
+            continue
+        ok, errs = parse_ok(patched, suffix)
+        if ok:
+            return patch_text, ""  # clean: applies + parses
+        last_err = "applying it introduces a syntax error — " + "; ".join(errs[:3])
+    return patch_text, ("Generated patch still fails syntax/apply after retries: "
+                        + (last_err or "") + " Verify on a real build.")
+
+
 def finalize(state: AgentState) -> Dict[str, Any]:
     """Ask model for final structured summary without new tools."""
     summary_prompt = HumanMessage(content="""Finalize now. No more tools.
@@ -244,20 +299,12 @@ Provide:
             top = verified[0]
             full = r.read_file(top, max_chars=24000)
             if not full.startswith("[error") and not full.startswith("[refused"):
-                trunc = "\n... [file truncated at 24000 chars] ..." if len(full) >= 24000 else ""
-                refine_msgs = [
-                    SystemMessage(content=SYSTEM),
-                    HumanMessage(content=f"Bug:\n{state.get('bug_report','')}\n\n"
-                                         f"Root-cause summary:\n{text[:1500]}"),
-                    HumanMessage(content=(
-                        f"Full current content of `{top}` below. Output ONLY a unified diff "
-                        f"that applies CLEANLY against this exact file (real context lines, "
-                        f"correct path), or `N/A` if no change is warranted.\n\n"
-                        f"```\n{full}{trunc}\n```")),
-                ]
-                patch = llm.invoke(refine_msgs)
-                patch_text = patch.content if isinstance(patch.content, str) else str(patch.content)
+                patch_text, syntax_note = _grounded_patch_loop(
+                    full, top, state.get("bug_report", ""), text[:1500])
                 text += "\n\n## Patch (grounded in full file: " + top + ")\n" + patch_text
+                if syntax_note:
+                    text += "\n\n> ⚠ " + syntax_note
+                    needs_review = True
         else:
             text += "\n\n> ⚠ Patch not grounded: source folder not mounted (index-only " \
                     "mode). The draft diff above is from partial chunks — verify manually."
