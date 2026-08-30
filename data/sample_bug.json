@@ -1,0 +1,4 @@
+{
+  "bug_report": "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON. Customer mapping present under vendor/.",
+  "stack": ["hmi", "carservice", "aidl", "vhal", "vss", "customer"]
+}

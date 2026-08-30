@@ -303,3 +303,45 @@ Localize, BugCerberus, RepairAgent, CoSIL, SWE-bench) and LLM+automotive/VSS/VHA
 RAG for vehicle design). Stated the gap: agentic hybrid-RAG localization on full-stack
 AAOS + OEM-first + per-customer IP isolation is underexplored. Natural baselines: BLAgent,
 BugCerberus (localization); Secure Multifaceted-RAG (isolation design).
+
+---
+
+# Update 12 — AST-based chunking (tree-sitter)
+
+Replaced the primary chunker for code files with tree-sitter AST chunking (the weakness
+vs. BLAgent): cut at whole methods/functions instead of text boundaries, and prefix each
+chunk with its structural path (`// File.java :: Class.method`) so both dense and BM25 see
+where the code lives.
+
+- `retrieval/chunker.py`: `_ast_chunks()` for Java + C/C++ (`method_declaration`,
+  `constructor_declaration`, `function_definition`), with correct C++ name extraction
+  (follows the declarator chain, ignores parameters). Large units split with overlap,
+  header preserved on each piece.
+- Everything else (`.aidl`, `.bp`, `.yaml`, `.json`, `.xml`) and any parse failure fall
+  back to the existing regex chunker. Degrades silently if grammars aren't installed.
+- `requirements.txt`: tree-sitter + tree-sitter-java + tree-sitter-cpp enabled.
+
+Verified on real Java/C++: method-level chunks with `Class.method` headers; C++ names
+correct (getValues/setValues), no parameter leakage; yaml falls back to regex.
+
+Note: benefit is not yet quantified — needs the labeled eval (recall@k) to confirm the
+gain over regex. That's the next dependency.
+
+---
+
+# Update 13 — AST coverage: + Kotlin, + VSS signal-tree chunking
+
+Extended chunking to more of the full stack:
+- **Kotlin** (HMI apps): tree-sitter-kotlin added; `.kt/.kts` chunk at
+  function/class/object level with `File.kt :: Class.fun` headers.
+- **VSS (yaml/json)**: `_vss_chunks()` parses the catalog and emits ONE chunk per leaf
+  signal, keyed by the full dotted path (`Vehicle.Cabin.Seat.Row1.Position`), unwrapping
+  the `children` wrapper so paths are clean (the labelling bug from the thesis). Non-VSS
+  yaml/json falls back to regex.
+- Java + C/C++ unchanged.
+
+Coverage now: Java, Kotlin, C/C++ → AST; VSS yaml/json → signal-tree; `.aidl/.bp/.te/.xml`
+and any failure → regex fallback. `requirements.txt`: + tree-sitter-kotlin.
+
+Verified: Kotlin method-level chunks; VSS per-signal chunks with clean dotted paths (no
+CHILDREN); Java/C++ intact.

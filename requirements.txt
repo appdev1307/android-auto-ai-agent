@@ -19,7 +19,8 @@ tqdm>=4.66.0
 
 # System dependency (not pip): ripgrep (rg)
 
-# Optional / future — AST-based chunking (not used by the regex chunker yet):
-# tree-sitter>=0.22.0
-# tree-sitter-java>=0.21.0
-# tree-sitter-cpp>=0.22.0
+# AST-based chunking (Java/C++); falls back to regex if absent
+tree-sitter>=0.22.0
+tree-sitter-java>=0.21.0
+tree-sitter-cpp>=0.22.0
+tree-sitter-kotlin>=0.3.0

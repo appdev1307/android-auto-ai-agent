@@ -150,6 +150,185 @@ def iter_files(root: Path, extra_roots: list[str] | None = None,
             yield path
 
 
+# ── AST-based chunking (tree-sitter) ─────────────────────────────
+# Cut code at real semantic units (whole methods/functions) instead of at text
+# boundaries, and prefix each chunk with its structural path (Class.method) so
+# retrieval sees where the code lives — better localization than regex splits.
+# Java + C/C++ only; everything else (.aidl, .bp, .yaml, .json, ...) and any
+# parse failure fall back to the regex chunker. Degrades silently if the
+# tree-sitter grammars aren't installed.
+_TS = {"tried": False, "java": None, "cpp": None, "kotlin": None}
+
+_AST_LANG = {
+    ".java": "java",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".c": "cpp", ".h": "cpp", ".hpp": "cpp", ".hh": "cpp",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+}
+_UNIT_TYPES = {
+    "method_declaration", "constructor_declaration",   # java
+    "function_definition",                             # cpp
+    "function_declaration", "secondary_constructor",   # kotlin
+}
+_SCOPE_TYPES = {
+    "class_declaration", "interface_declaration", "enum_declaration",   # java
+    "class_specifier", "struct_specifier", "namespace_definition",      # cpp
+    "object_declaration",                                               # kotlin (class_declaration shared)
+}
+
+
+def _get_parser(lang: str):
+    if not _TS["tried"]:
+        _TS["tried"] = True
+        try:
+            from tree_sitter import Language, Parser
+            import tree_sitter_java as tsj
+            import tree_sitter_cpp as tsc
+            _TS["java"] = Parser(Language(tsj.language()))
+            _TS["cpp"] = Parser(Language(tsc.language()))
+            try:
+                import tree_sitter_kotlin as tsk
+                _TS["kotlin"] = Parser(Language(tsk.language()))
+            except Exception:
+                _TS["kotlin"] = None
+        except Exception:
+            _TS["java"] = _TS["cpp"] = _TS["kotlin"] = None
+    return _TS.get(lang)
+
+
+def _node_name(node) -> str:
+    n = node.child_by_field_name("name")
+    if n is not None and n.text:
+        return n.text.decode("utf-8", "ignore")
+    # C/C++ functions: follow the declarator chain to the name,
+    # WITHOUT descending into the parameter list.
+    d = node.child_by_field_name("declarator")
+    guard = 0
+    while d is not None and guard < 12:
+        guard += 1
+        if d.type in ("identifier", "field_identifier", "qualified_identifier",
+                      "operator_name", "destructor_name") and d.text:
+            return d.text.decode("utf-8", "ignore")
+        nd = d.child_by_field_name("declarator")
+        if nd is None:
+            for ch in d.children:
+                if ch.type in ("identifier", "field_identifier", "qualified_identifier") and ch.text:
+                    return ch.text.decode("utf-8", "ignore")
+            break
+        d = nd
+    return ""
+
+
+def _collect_units(node, stack: list[str], out: list[tuple]):
+    t = node.type
+    if t in _UNIT_TYPES:
+        name = _node_name(node)
+        qn = ".".join([s for s in stack if s] + ([name] if name else []))
+        out.append((qn, node.start_byte, node.end_byte))
+        return  # keep the whole unit; don't split into nested units
+    if t in _SCOPE_TYPES:
+        stack = stack + [_node_name(node)]
+    for ch in node.children:
+        _collect_units(ch, stack, out)
+
+
+def _ast_chunks(path: Path, text: str, chunk_size: int, overlap: int) -> list[dict] | None:
+    lang = _AST_LANG.get(path.suffix.lower())
+    if not lang:
+        return None
+    parser = _get_parser(lang)
+    if parser is None:
+        return None
+    try:
+        tree = parser.parse(bytes(text, "utf-8"))
+    except Exception:
+        return None
+    units: list[tuple] = []
+    _collect_units(tree.root_node, [], units)
+    if not units:
+        return None
+    src = text.encode("utf-8")
+    chunks: list[dict] = []
+    for qn, s, e in units:
+        code = src[s:e].decode("utf-8", "ignore")
+        header = f"// {path.name} :: {qn}\n" if qn else ""
+        if len(code) <= int(chunk_size * 1.5):
+            chunks.append(_make_chunk(path, header + code, len(chunks)))
+        else:
+            start = 0
+            while start < len(code):
+                end = min(len(code), start + chunk_size)
+                chunks.append(_make_chunk(path, header + code[start:end], len(chunks)))
+                if end >= len(code):
+                    break
+                start = max(end - overlap, start + 1)
+    return chunks
+
+
+# ── VSS signal-tree chunking (yaml/json) ─────────────────────────
+# VSS catalogs are hierarchical DATA, not code — chunk them by signal, one leaf
+# per chunk, keyed by the full dotted path (Vehicle.Cabin.Seat.Row1.Position).
+# Unwraps the "children" wrapper so paths are clean (the labelling bug the thesis
+# hit). Non-VSS yaml/json falls back to the regex chunker.
+_VSS_EXTS = {".yaml", ".yml", ".json", ".vss"}
+
+
+def _looks_like_vss(data) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if "Vehicle" in data:
+        return True
+    blob = str(data)[:4000]
+    return ('"children"' in blob or "'children'" in blob or "datatype" in blob)
+
+
+def _vss_walk(node, prefix, out):
+    if not isinstance(node, dict):
+        return
+    children = node.get("children") if isinstance(node.get("children"), dict) else None
+    if "datatype" in node and node.get("type") != "branch":
+        # a leaf signal — emit it
+        keep = {k: node[k] for k in ("datatype", "type", "unit", "description",
+                                     "min", "max", "allowed", "vhal_property",
+                                     "property", "areaId") if k in node}
+        out.append((prefix, keep))
+    for name, child in (children or {}).items():
+        _vss_walk(child, f"{prefix}.{name}" if prefix else name, out)
+    # some catalogs nest without a "children" wrapper
+    if children is None:
+        for name, child in node.items():
+            if isinstance(child, dict) and name not in ("datatype", "type", "unit",
+                                                        "description", "min", "max",
+                                                        "allowed"):
+                _vss_walk(child, f"{prefix}.{name}" if prefix else name, out)
+
+
+def _vss_chunks(path: Path, text: str) -> list[dict] | None:
+    if path.suffix.lower() not in _VSS_EXTS:
+        return None
+    try:
+        if path.suffix.lower() == ".json":
+            import json as _json
+            data = _json.loads(text)
+        else:
+            import yaml as _yaml
+            data = _yaml.safe_load(text)
+    except Exception:
+        return None
+    if not _looks_like_vss(data):
+        return None
+    leaves: list[tuple] = []
+    root = data.get("Vehicle") if "Vehicle" in data else data
+    _vss_walk(root, "Vehicle" if "Vehicle" in data else "", leaves)
+    if not leaves:
+        return None
+    chunks: list[dict] = []
+    for sigpath, attrs in leaves:
+        body = f"VSS signal: {sigpath}\n" + "\n".join(f"{k}: {v}" for k, v in attrs.items())
+        chunks.append(_make_chunk(path, body, len(chunks)))
+    return chunks
+
+
 def chunk_file(path: Path, chunk_size: int = 1200, overlap: int = 200) -> list[dict]:
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
@@ -157,6 +336,16 @@ def chunk_file(path: Path, chunk_size: int = 1200, overlap: int = 200) -> list[d
         return []
     if not text.strip():
         return []
+
+    # 1. VSS signal-tree chunking for VSS-looking yaml/json
+    vss = _vss_chunks(path, text)
+    if vss:
+        return vss
+
+    # 2. AST first for code; regex fallback for everything else / on failure.
+    ast = _ast_chunks(path, text, chunk_size, overlap)
+    if ast:
+        return ast
 
     # Prefer structural splits when possible
     spans: list[str] = []
