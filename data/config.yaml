@@ -6,6 +6,30 @@ model:
 
 rag:
   enabled: true
+  # Index scope presets — pick one at RUN time with `--scope` (indexer) /
+  # the notebook SCOPE var. Not hard-coded: change scope without touching code.
+  #   automotive : the AAOS stack (Car + automotive HAL + car apps)
+  #   framework  : automotive + frameworks/base (fuller cross-layer coverage)
+  #   full       : whole tree (real full-stack; needs a full checkout)
+  scopes:
+    automotive:
+      - "packages/services/Car"
+      - "hardware/interfaces/automotive"
+      - "packages/apps/Car"
+      - "vendor"
+      - "device"
+    framework:
+      - "packages/services/Car"
+      - "hardware/interfaces/automotive"
+      - "packages/apps/Car"
+      - "frameworks/base"
+      - "frameworks/av"
+      - "vendor"
+      - "device"
+    full:
+      - "."
+  default_scope: "automotive"
+  # legacy flat list (still honored if `scopes`/--scope not used)
   index_roots:
     - "vendor"
     - "device"

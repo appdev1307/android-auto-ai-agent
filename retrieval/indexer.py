@@ -98,10 +98,24 @@ def _resolve_store_dir(rag: dict, *, base: bool, customer: str | None,
     return root / customer / project / aosp_version
 
 
+def _resolve_scope_roots(rag: dict, scope: str | None) -> list[str]:
+    """Resolve --scope to a list of index roots from config. No hard-coding:
+    presets live in config `rag.scopes`; fall back to legacy `index_roots`."""
+    scopes = rag.get("scopes") or {}
+    name = scope or rag.get("default_scope") or "automotive"
+    if name in scopes:
+        return scopes[name]
+    if scope and scope not in scopes:
+        print(f"[scope] unknown scope '{scope}', known={list(scopes)}; "
+              f"using legacy index_roots")
+    return rag.get("index_roots") or ["packages/services/Car", "hardware/interfaces/automotive"]
+
+
 def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
                 base: bool = False, customer: str | None = None,
                 project: str = "default", aosp_version: str = "aosp15",
-                reset: bool = False, incremental: bool = False):
+                reset: bool = False, incremental: bool = False,
+                scope: str | None = None):
     cfg = load_config(config_path)
     rag = cfg["rag"]
     root = Path(aosp_root).resolve()
@@ -199,10 +213,11 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
 
     else:
         # ---- full build -------------------------------------------
-        index_roots = rag.get("index_roots") or ["vendor", "device", "packages/services/Car"]
+        index_roots = _resolve_scope_roots(rag, scope)
+        print(f"[scope] {scope or rag.get('default_scope','automotive')} -> {index_roots}")
         files: list[Path] = []
         for rel in index_roots:
-            b = root / rel
+            b = root / rel if rel != "." else root
             if b.exists():
                 files.extend(list(iter_files(b, mode=mode)))
             else:
@@ -238,7 +253,9 @@ if __name__ == "__main__":
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--incremental", action="store_true",
                     help="only re-index files changed since the last indexed git SHA")
+    ap.add_argument("--scope", default=None,
+                    help="index scope preset from config (automotive|framework|full|...)")
     args = ap.parse_args()
     build_index(args.aosp_root, args.config, base=args.base, customer=args.customer,
                 project=args.project, aosp_version=args.aosp_version,
-                reset=args.reset, incremental=args.incremental)
+                reset=args.reset, incremental=args.incremental, scope=args.scope)

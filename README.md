@@ -85,6 +85,45 @@ diff (or N/A), and a `needs_human_review` flag.
 
 ---
 
+## Index scope (choose at runtime, not hard-coded)
+
+How much of the stack to index is a **runtime choice**, via `--scope` (presets live in
+`data/config.yaml` under `rag.scopes`):
+
+| `--scope` | Covers | Notes |
+|-----------|--------|-------|
+| `automotive` (default) | Car + automotive HAL + car apps + vendor/device | AAOS stack; small, fast |
+| `framework` | above **+ `frameworks/base`, `frameworks/av`** | fuller cross-layer coverage |
+| `full` | whole tree (`.`) | real full-stack; needs a full checkout |
+
+```bash
+python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --scope framework
+```
+
+Add or edit presets in config — no code change. `automotive` alone is **not** full-stack
+(no `frameworks/base`); use `framework` or `full` when a bug crosses into the platform.
+
+## Run on Colab (dev phase, no server)
+
+For development you don't need a server or the full 150 GB tree. Index the automotive
+**subset once → to Google Drive**, then develop against that persistent index.
+
+Use the notebook `AAOS_Agent_Colab_A100.ipynb` (A100 80GB runtime). It:
+1. mounts Drive (index + model cache persist there),
+2. shallow-clones only `packages/services/Car` + `hardware/interfaces/automotive`
+   (~hundreds of MB, not full AOSP),
+3. indexes that subset to `stores_root` on Drive (skips if already built),
+4. serves Qwen2.5-Coder-32B via vLLM and runs the agent.
+
+**Index vs source.** The index (Chroma + BM25) is the durable asset — it lives on Drive
+and is reused every session. The source subset is cheap; it's re-cloned per session.
+Keeping it on disk lets the ripgrep channel + `read_source` work. If you drop it, the
+agent still runs in **index-only mode** (dense + BM25 carry the code content; exact-search
+and `read_source` are disabled, and it says so at startup). Full-AOSP + `--incremental`
+re-sync is a production concern, not needed for dev.
+
+---
+
 ## Architecture
 
 ```

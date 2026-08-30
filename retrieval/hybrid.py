@@ -73,6 +73,15 @@ class HybridRetriever:
         self.store: VectorStore | None = store
         self.cross_encoder: CrossEncoder | None = None
 
+        # Dev workflow indexes once (index persists) and may discard the source
+        # tree. Dense + BM25 read content from the index and keep working; the
+        # exact/ripgrep channel and read_source need files on disk, so they
+        # degrade gracefully when the source is not mounted.
+        self.source_present = self.aosp_root.exists() and str(self.aosp_root) != "."
+        if not self.source_present:
+            print(f"[retriever] source tree not mounted ({self.aosp_root}) — "
+                  f"index-only mode: dense+BM25 active, exact-search & read_source disabled.")
+
         if self.rag.get("enabled", True):
             self._init_embedder()
             if self.store is None:
