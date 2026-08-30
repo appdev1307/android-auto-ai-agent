@@ -196,3 +196,25 @@ no remotes.
 Kept: `--base` / `--customer` tier filter and `--incremental` (a pure LOCAL
 `git diff` between two SHAs already in the tree you provided — not a fetch).
 README + indexer docstring updated to state the boundary explicitly.
+
+---
+
+# Update 6 — Prompt correctness (not complexity)
+
+Prompt is intentionally simple — the signal lives in retrieval, not phrasing (same
+ceiling the thesis hit with DSPy/MIPROv2). Fixed 4 correctness bugs, no added complexity:
+
+- **Few-shot no longer teaches path fabrication.** `fewshot_localize.md` used `.../` in
+  paths, implicitly training the model that abbreviated/invented paths are OK. Replaced
+  with full real AOSP paths + an explicit "illustrative format only" disclaimer.
+- **Grounding clause** in `system.md`: "You have NO prior knowledge of this tree; every
+  path/symbol MUST come verbatim from a tool result; never invent/abbreviate a path."
+  Directly targets the #1 localization failure (hallucinated paths).
+- **Strict output contract**: ranked files as `N. <full/path> [layer]`, one per line, so
+  finalize's path extraction + verification is reliable.
+- **Honest-diff clause**: only emit a diff after read_source and only if it would apply
+  cleanly; otherwise describe the change in words instead of fabricating a diff. Plus an
+  explicit `needs_human_review: true|false` line forced true for VHAL/VSS/AIDL/power/SELinux.
+
+Not changed: the real levers for patch quality (full-file context + `git apply --check`
+validation loop + labeled eval) are architecture, not prompt.
