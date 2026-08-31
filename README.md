@@ -287,3 +287,30 @@ to root, embed-model mismatch raises.
 `data/config.yaml` — model endpoint, `stores_root`, index roots, embed model, ranking weights
 (`ce_blend`, `prior_customer`, `prior_customer_store`, `prior_hidl_penalty`), `max_tool_iters`,
 safety (`auto_apply: false`). Swap the embed model to a code-embedding model when you can afford it.
+
+---
+
+## Roadmap — next phase (requirement conformance)
+
+Current PoC checks **syntax** (parse-check) and **semantic-framework** (AAOS layer/contract
+correctness). The next phase adds **semantic-requirement**: does the code match the OEM's
+own spec (VSS spec, HMI design, logic diagram)? This reuses most of what's here —
+multi-tenant store (isolated OEM specs), VSS chunker, hybrid RAG, ReAct agent — following
+the 2-agent `ruleMiner → codeAuditor` pattern, with a verification filter to fight LLM
+over-correction (a documented failure mode for code-vs-spec judgement).
+
+Planned order (start small, measure, then expand):
+
+1. **Pick a machine-readable spec form** — start with VSS spec (yaml/json; easy). Defer
+   HMI design / logic diagrams (usually images/PDF — the hardest blocker).
+2. **Minimal ruleMiner + codeAuditor for VSS spec** — e.g. "signal X must update ≤ 100 ms /
+   range / mandatory" vs the code, reusing the existing RAG + agent.
+3. **Verification filter** — validate the model's verdict with tests / counterfactuals to
+   cut false positives (over-correction bias).
+4. **Small conformance eval** — a few labeled spec-violations; measure before expanding.
+5. Only once conformance works → HMI / logic-diagram specs (hard) and full requirement
+   decomposition + traceability (customer → system → SW → HLD → LLD, the V-model).
+
+Principle: chop into per-layer PoCs, each measurable, before taking on more. Requirement
+decomposition is a whole requirements-engineering system, not a single feature — don't
+build the whole chain at once. See `NEXT_PHASE.md` for the fuller write-up.
