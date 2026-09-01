@@ -12,10 +12,11 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langgraph.prebuilt import ToolNode
 
 from agent.state import AgentState
-from agent.tools_def import ALL_TOOLS, set_retriever
+from agent.tools_def import ALL_TOOLS, set_retriever, get_retriever
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
 from retrieval.chunker import apply_unified_diff, parse_ok
+from agent.specialists import make_specialists_node, format_specialist_notes
 
 
 def load_config() -> dict:
@@ -114,14 +115,14 @@ def agent_reason(state: AgentState) -> Dict[str, Any]:
     return {"messages": [resp], "status": "reasoning", "iterations": iters}
 
 
-def should_continue(state: AgentState) -> Literal["tools", "finalize"]:
+def should_continue(state: AgentState) -> Literal["tools", "specialists"]:
     # Hard stop before LangGraph's recursion_limit turns into a crash.
     if int(state.get("iterations", 0)) >= MAX_TOOL_ITERS:
-        return "finalize"
+        return "specialists"
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
         return "tools"
-    return "finalize"
+    return "specialists"
 
 
 tool_node = ToolNode(ALL_TOOLS)
@@ -264,7 +265,9 @@ Provide:
 ## Unit test ideas
 ## needs_human_review: true/false
 """)
-    messages = [SystemMessage(content=SYSTEM)] + list(state.get("messages", [])) + [summary_prompt]
+    spec_notes = format_specialist_notes(state.get("specialist_notes") or [])
+    sys_with_specialists = SYSTEM + spec_notes
+    messages = [SystemMessage(content=sys_with_specialists)] + list(state.get("messages", [])) + [summary_prompt]
     resp = llm.invoke(messages)
     text = resp.content if isinstance(resp.content, str) else str(resp.content)
     low = text.lower()
@@ -327,3 +330,7 @@ Provide:
         "root_cause": text[:2000],
         "candidate_files": verified,
     }
+
+
+# Multi-agent per-layer specialists (built once, reuse shared llm + active retriever)
+specialists = make_specialists_node(llm, get_retriever)

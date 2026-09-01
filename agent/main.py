@@ -92,6 +92,7 @@ def run(graph, bug: str, aosp_root: str | None, log: str | None, tenant: dict | 
         "status": "start",
         "needs_human_review": True,
         "iterations": 0,
+        "specialist_notes": [],
     }
     try:
         result = graph.invoke(state, config={"recursion_limit": 25})

@@ -13,6 +13,10 @@ def set_retriever(r):
     _retriever = r
 
 
+def get_retriever():
+    return _retriever
+
+
 @tool
 def hybrid_search(query: str) -> str:
     """Hybrid search (vector RAG + exact) over AAOS/SDV tree. Customer/OEM paths boosted.

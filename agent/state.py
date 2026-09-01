@@ -18,3 +18,4 @@ class AgentState(TypedDict):
     status: str
     needs_human_review: bool
     iterations: int
+    specialist_notes: list

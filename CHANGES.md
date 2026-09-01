@@ -393,3 +393,26 @@ mismatched index, so this can't silently mis-rank.
 
 Not benchmarked yet — candidate chosen by coverage/fit; measure with the eval harness after
 phase 1 runs (per the roadmap).
+
+---
+
+# Update 16 — Per-layer specialists (multi-agent) via dedicated system prompts
+
+The single generic prompt gave no per-layer / per-artifact guidance. Added a multi-agent
+layer: after the ReAct agent gathers evidence, a specialist is consulted for each layer the
+evidence touches, each with its OWN system prompt tuned to that layer's artifacts and
+failure modes.
+
+- `prompts/specialists/{vhal,carservice,aidl,hmi,vss}.md` — 5 specialist system prompts.
+  Each: role + artifacts it owns + what to check + layer boundary (don't judge other layers)
+  + output contract (is the root cause here? which file? why, grounded in a snippet).
+- `agent/specialists.py` — `make_specialists_node(llm, get_retriever)`: groups retrieved
+  evidence by layer, runs the matching specialist per layer (capped at MAX_SPECIALISTS=3 to
+  bound cost), returns per-layer assessments. `format_specialist_notes` renders them.
+- Graph: `agent →(should_continue)→ tools | specialists`, `specialists → finalize`. Finalize
+  folds the specialist assessments into its context before ranking/patching.
+- `tools_def.get_retriever()` added; `state.specialist_notes` added; main seeds it.
+
+Multi-agent = a router-free fan-out: the ReAct generalist finds evidence, layer specialists
+(distinct system prompts) judge their own layer, finalize aggregates. Still pure LLM + RAG.
+Verified: graph wiring, 5 prompts (role/artifacts/boundary/output), cap, factory/formatter.
