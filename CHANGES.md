@@ -373,3 +373,23 @@ produces a clean, parsing diff.
 
 Intended use: produce the syntactically cleanest diff possible before a full build; final
 compile/link validation still happens on the real Android source tree (e.g. on GCP).
+
+---
+
+# Update 15 — Code-aware embeddings (Qwen3-Embedding-0.6B)
+
+Swapped the embed model from all-MiniLM (NLP-only, doesn't understand code) to
+`Qwen/Qwen3-Embedding-0.6B`:
+- Code-aware, covers the full stack (Java/Kotlin/C++/AIDL) AND requirement text — one model
+  for both, which the next-phase requirement-conformance work needs.
+- Small (0.6B): fine on CPU at query time (while vLLM holds the GPU); indexing runs before
+  vLLM so it can use the GPU. Configurable output dims.
+- Same sentence-transformers interface → no code change beyond `embed_model`.
+- `requirements.txt`: transformers>=4.51.0 (Qwen3-Embedding support).
+
+**Re-index required**: new embeddings live in a different vector space; existing indexes are
+invalid. Rebuild with `--reset`. The store manifest embed-model guard will refuse a
+mismatched index, so this can't silently mis-rank.
+
+Not benchmarked yet — candidate chosen by coverage/fit; measure with the eval harness after
+phase 1 runs (per the roadmap).

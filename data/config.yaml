@@ -44,7 +44,10 @@ rag:
     - "customer"
     - "vss"
     - "signal"
-  embed_model: "sentence-transformers/all-MiniLM-L6-v2"
+  embed_model: "Qwen/Qwen3-Embedding-0.6B"   # code-aware, covers Java/Kotlin/C++/AIDL + requirement text
+  # NOTE: changing embed_model invalidates existing indexes (vectors live in a
+  # different space). Re-index with --reset. The store manifest guard will refuse
+  # to serve a mismatched index. Lighter alt: all-MiniLM-L6-v2 (NLP-only, no code).
   chunk_size: 1200
   chunk_overlap: 200
   top_k_vector: 20

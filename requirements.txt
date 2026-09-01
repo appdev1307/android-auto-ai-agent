@@ -11,6 +11,7 @@ python-dotenv>=1.0.0
 # Hybrid RAG
 chromadb>=0.5.0
 sentence-transformers>=3.0.0
+transformers>=4.51.0        # Qwen3-Embedding support
 numpy>=1.26.0
 rank-bm25>=0.2.2
 
