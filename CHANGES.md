@@ -444,3 +444,38 @@ parses bare `true/false/on/off/yes/no`, numbers, and `null` as bool/int/None key
 random config file. Guarded both with `isinstance(key, str)`.
 Stress-tested against bool/number/None/list keys, empty dict, nested — no crash; VSS
 (json tree + COVESA .vspec) still chunks per-signal.
+
+---
+
+# Update 19 — Operator hint for power/resume subscription drops
+
+Added `hints/10-power-resume-subscription.md`.
+
+This is the exact class of bug demonstrated by the sample:
+"Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON".
+
+The agent correctly ranked the VSS mapping + CarPropertyService and identified that
+the mapping is present but the subscription is not re-established after the A15 power
+path. The new hint makes the diagnostic order and preferred fix locations (client
+re-registration on power policy / onResume) explicit so future runs are more likely
+to propose a grounded patch instead of N/A, while still forcing human review on
+VHAL/VSS/power paths.
+
+---
+
+# Update 20 — Correct hint vs skill separation
+
+Removed `hints/10-power-resume-subscription.md`.
+
+Reason: that content is **framework / AOSP 15 compliance knowledge**, not customer-
+specific. Per project design (and operator feedback), `hints/` is reserved for:
+- customer-specific requirements
+- customer patches / naming
+- chipset-specific quirks
+- project-local known-good mappings or handlers (e.g. OemPowerPolicyHandler)
+
+General diagnostic patterns (subscription drops after ignition/resume, diagnostic
+order, preferred fix locations) were moved into `skills/android_automotive.md`
+where framework knowledge belongs.
+
+`hints/` stays clean for true OEM overlays only.
