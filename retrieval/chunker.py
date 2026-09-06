@@ -7,7 +7,7 @@ from typing import Iterator
 
 CODE_EXTS = {
     ".java", ".kt", ".kts", ".cpp", ".cc", ".c", ".h", ".hpp",
-    ".aidl", ".hal", ".bp", ".xml", ".yaml", ".yml", ".json", ".vss",
+    ".aidl", ".hal", ".bp", ".xml", ".yaml", ".yml", ".json", ".vss", ".vspec",
 }
 
 # ── HIDL exclusion ───────────────────────────────────────────────
@@ -352,7 +352,7 @@ def apply_unified_diff(original: str, diff_text: str) -> str | None:
 # per chunk, keyed by the full dotted path (Vehicle.Cabin.Seat.Row1.Position).
 # Unwraps the "children" wrapper so paths are clean (the labelling bug the thesis
 # hit). Non-VSS yaml/json falls back to the regex chunker.
-_VSS_EXTS = {".yaml", ".yml", ".json", ".vss"}
+_VSS_EXTS = {".yaml", ".yml", ".json", ".vss", ".vspec"}
 
 
 def _looks_like_vss(data) -> bool:
@@ -360,8 +360,25 @@ def _looks_like_vss(data) -> bool:
         return False
     if "Vehicle" in data:
         return True
+    # COVESA .vspec: flat dotted keys like "Vehicle.Speed:" -> {datatype/type/unit/...}
+    if any("." in k and isinstance(v, dict) for k, v in data.items()):
+        return True
     blob = str(data)[:4000]
     return ('"children"' in blob or "'children'" in blob or "datatype" in blob)
+
+
+def _vspec_flat_leaves(data) -> list[tuple]:
+    """COVESA .vspec is a flat dict of dotted-path -> attributes (branches too).
+    Keep the ones that look like actual signals (have a datatype)."""
+    out = []
+    for key, val in data.items():
+        if not isinstance(val, dict) or "." not in key:
+            continue
+        if "datatype" in val or val.get("type") in ("sensor", "actuator", "attribute"):
+            keep = {k: val[k] for k in ("type", "datatype", "unit", "description",
+                                        "min", "max", "allowed") if k in val}
+            out.append((key, keep))
+    return out
 
 
 def _vss_walk(node, prefix, out):
@@ -399,9 +416,14 @@ def _vss_chunks(path: Path, text: str) -> list[dict] | None:
         return None
     if not _looks_like_vss(data):
         return None
-    leaves: list[tuple] = []
-    root = data.get("Vehicle") if "Vehicle" in data else data
-    _vss_walk(root, "Vehicle" if "Vehicle" in data else "", leaves)
+    # COVESA .vspec flat dotted-key format
+    flat = _vspec_flat_leaves(data)
+    if flat:
+        leaves = flat
+    else:
+        leaves = []
+        root = data.get("Vehicle") if "Vehicle" in data else data
+        _vss_walk(root, "Vehicle" if "Vehicle" in data else "", leaves)
     if not leaves:
         return None
     chunks: list[dict] = []

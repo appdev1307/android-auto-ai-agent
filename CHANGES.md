@@ -416,3 +416,20 @@ failure modes.
 Multi-agent = a router-free fan-out: the ReAct generalist finds evidence, layer specialists
 (distinct system prompts) judge their own layer, finalize aggregates. Still pure LLM + RAG.
 Verified: graph wiring, 5 prompts (role/artifacts/boundary/output), cap, factory/formatter.
+
+---
+
+# Update 17 — HMI (Car UI libs) + VSS (COVESA .vspec) coverage
+
+Notebook cell 3 now also clones:
+- **HMI**: `packages/apps/Car/libs` (Car UI Library) — the HMI framework core, not just Settings.
+- **VSS**: COVESA `vehicle_signal_specification` → dropped under `vendor/vss` so the customer
+  priors + VSS signal-tree chunker pick it up (automotive scope already indexes `vendor/`).
+
+chunker.py: COVESA files use the `.vspec` extension with a flat dotted-key format
+(`Vehicle.Speed:` -> {type/datatype/unit/...}) and `#include` directives.
+- `.vspec` added to CODE_EXTS (was skipped entirely) + _VSS_EXTS.
+- `_vspec_flat_leaves()` emits one chunk per signal from the flat dotted-key form;
+  `#include` lines are YAML comments so they're ignored. Nested-tree VSS (JSON/OEM catalog)
+  still handled by the existing walker.
+Verified: a COVESA .vspec is indexable and chunked per-signal (Vehicle.Speed, Seat.Row1.Pos).
