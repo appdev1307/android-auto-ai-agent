@@ -269,14 +269,21 @@ def finalize(state: AgentState) -> Dict[str, Any]:
     summary_prompt = HumanMessage(content="""Finalize now. No more tools.
 Follow skills/patch_and_ut.md for any patch or unit-test content.
 
+HARD RULES:
+- Do NOT invent file paths.
+- Do NOT emit a unified diff (---/+++/@@) unless you read that exact file with
+  read_source in this run. Otherwise: Proposed patch (draft): N/A — words only.
+
 Provide:
 ## Candidate files (ranked)   — one per line as `N. <full/path> [layer]`, only files seen in tool results
 ## Root cause                 — grounded in retrieved snippets
-## Proposed patch (draft)     — unified diff ONLY if you read the target file and the change is minimal;
-                                prefer customer/OEM path; else describe the change in words or N/A.
-                                (a full-file-grounded diff is generated automatically after this)
-## Unit test ideas            — concrete test names + assertions using existing AAOS patterns
-                                (Car test utils, mock VHAL, power-policy simulation). No new frameworks.
+## Proposed patch (draft)     — unified diff ONLY if file was read and change is minimal;
+                                prefer customer/OEM path; else N/A + describe in words.
+## Unit test ideas            — AAOS-native frameworks only:
+                                Java/HMI/CarService: JUnit4 + Robolectric or instrumentation;
+                                VHAL/native: GoogleTest (gtest/gmock); HAL: VTS when applicable.
+                                For each: Framework + TestName + setup/action/assert.
+                                No new frameworks. No vague bullets.
 ## needs_human_review: true/false
    MUST be true if the change touches VHAL, VSS, power, SELinux, or AIDL.
 """)

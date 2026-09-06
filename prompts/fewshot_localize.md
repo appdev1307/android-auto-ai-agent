@@ -44,14 +44,17 @@ Root cause: client registers CarPropertyManager callback only in onCreate; after
 policy tear-down the callback is not re-registered. Mapping and VHAL path are fine.
 Evidence: single registerCallback in onCreate; no re-register in power-policy / onResume path.
 
-Proposed patch (draft): N/A as full diff — describe change:
-In vendor/oem/.../SpeedController.java extract registerSpeedListener() and call it from
+Proposed patch (draft): N/A — describe change in words only (file not verified as fully read in this example).
+In the OEM SpeedController (path from tools): extract registerSpeedListener() and call it from
 both initial setup and the existing power-policy / onResume path. Do not touch VSS mapping
 or DefaultProperties.json.
 
 Unit test ideas:
-- speedCallbackResumesAfterPowerOn — simulate CarPowerManager OFF→ON, change PERF_VEHICLE_SPEED,
-  assert callback invoked again.
-- speedCallbackSurvivesProcessResume — re-register path restores updates without full ignition cycle.
+Framework: JUnit4 + Robolectric (or instrumentation if package uses carservice_test style)
+Target module/dir: same package tests/ next to OEM cluster (or packages/services/Car/tests if fix is CarService)
+- speedCallbackResumesAfterPowerOn: setup mock CarPropertyManager + register via production helper;
+  action simulate CarPowerManager OFF→ON then emit PERF_VEHICLE_SPEED; assert callback invoked after ON
+- speedCallbackSurvivesProcessResume: setup same; action re-call register helper without full ignition;
+  assert updates received again and no NPE
 
 needs_human_review: true

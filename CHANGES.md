@@ -562,3 +562,15 @@ README (§5 Run, Multi-tenant, Config) updated to match.
 
 Verified: tenant-resolution branches (customer given / omit+_base exists / omit+no _base /
 omit+no stores_root) checked in isolation; `main.py` compiles.
+
+---
+
+# Update 25 — No fake diffs; AAOS-native UT frameworks
+
+- skills/patch_and_ut.md: hard anti-hallucination (§0); unified diff only if
+  read_source succeeded; SELinux rule; unit tests must name Framework
+  (JUnit4+Robolectric/instrumentation | GoogleTest+gmock | VTS) + TestName +
+  setup/action/assert.
+- prompts/system.md + skills/AGENTS.md + finalize summary_prompt: same rules.
+- fewshot Example 3: UT section uses Framework / Target / setup-action-assert form.
+- Model must not emit fabricated ---/+++/@@ when the file was not read.
