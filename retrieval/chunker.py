@@ -300,6 +300,22 @@ def parse_ok(text: str, suffix: str) -> tuple[bool, list[str]]:
     return (len(errs) == 0), errs
 
 
+def grammar_missing(suffix: str) -> bool:
+    """True iff `suffix` is a language we normally parse (Java/Kotlin/C/C++) but
+    its tree-sitter grammar is NOT installed in this environment.
+
+    In that state `parse_ok` returns (True, []) — it can't judge, so it doesn't
+    block — which means a patch passes WITHOUT any real syntax check. Callers use
+    this to say so out loud (and force human review) instead of silently
+    trusting an unparsed C++/native patch. A suffix with no language mapping
+    (.aidl/.json/.yaml) returns False: nothing was skipped, that's expected.
+    """
+    lang = _AST_LANG.get(suffix.lower())
+    if lang is None:
+        return False
+    return _get_parser(lang) is None
+
+
 def apply_unified_diff(original: str, diff_text: str) -> str | None:
     """Apply a unified diff to `original` in memory (no git, no disk).
     Returns the patched text, or None if a hunk's context doesn't match."""

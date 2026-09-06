@@ -24,7 +24,7 @@ _LAYER_FILE = {
     "hmi": "hmi.md",
     "vss": "vss.md",
     "customer": "hmi.md",   # OEM overlay: treat with the HMI/app specialist by default
-    "native": "vhal.md",    # native C/C++ outside vehicle/: VHAL specialist is closest
+    "native": "native.md",  # native services / non-vehicle HALs (C/C++)
 }
 
 MAX_SPECIALISTS = 3   # cap LLM calls per bug

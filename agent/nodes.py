@@ -15,7 +15,7 @@ from agent.state import AgentState
 from agent.tools_def import ALL_TOOLS, set_retriever, get_retriever
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
-from retrieval.chunker import apply_unified_diff, parse_ok
+from retrieval.chunker import apply_unified_diff, parse_ok, grammar_missing, guess_layer
 from agent.specialists import make_specialists_node, format_specialist_notes
 
 
@@ -342,6 +342,13 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
                                 "visible portion but syntax was not verified — verify on a real build.")
         ok, errs = parse_ok(patched, suffix)
         if ok:
+            # parse_ok returns ok=True both for "parsed cleanly" and for "no
+            # grammar to parse with". Don't let the latter masquerade as a real
+            # syntax pass on a C++/native (or Java/Kotlin) patch — say it plainly.
+            if grammar_missing(suffix):
+                return patch_text, (f"Syntax NOT verified: no tree-sitter grammar for "
+                                    f"'{suffix}' is installed here, so the parse-check was "
+                                    f"skipped. Install the grammar or verify on a real build.")
             return patch_text, ""  # clean: applies + parses
         last_err = "applying it introduces a syntax error — " + "; ".join(errs[:3])
     return patch_text, ("Generated patch still fails syntax/apply after retries: "
@@ -405,6 +412,18 @@ Provide:
                 + ", ".join(unverified)
     elif verified and not source_mounted:
         text += "\n\n> ℹ Candidate paths not checked against a tree (index-only mode)."
+
+    # Safety-critical layers ALWAYS require a human, checked against the actual
+    # candidate paths (not a prose substring: "alternative" contains "native").
+    # A native service, VHAL, VSS, AIDL or legacy-HIDL file among the candidates
+    # forces review even if the model self-reported needs_human_review: false.
+    ALWAYS_REVIEW_LAYERS = {"native", "vhal", "vss", "aidl", "hidl_legacy"}
+    candidate_layers = {guess_layer(p) for p in (verified + unverified)}
+    critical = candidate_layers & ALWAYS_REVIEW_LAYERS
+    if critical:
+        needs_review = True
+        text += "\n\n> ⚠ Human review required: candidates touch safety-critical " \
+                "layer(s): " + ", ".join(sorted(critical)) + "."
 
     # --- #1 Full-file context: regenerate the diff against the REAL full file ---
     # The first pass drafts a diff from ~1200-char chunks, so its context lines
