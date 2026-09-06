@@ -258,13 +258,18 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str) -> tuple[s
 def finalize(state: AgentState) -> Dict[str, Any]:
     """Ask model for final structured summary without new tools."""
     summary_prompt = HumanMessage(content="""Finalize now. No more tools.
+Follow skills/patch_and_ut.md for any patch or unit-test content.
+
 Provide:
 ## Candidate files (ranked)   — one per line as `N. <full/path> [layer]`, only files seen in tool results
 ## Root cause                 — grounded in retrieved snippets
-## Proposed patch (draft)     — unified diff if a code fix is warranted, else N/A
+## Proposed patch (draft)     — unified diff ONLY if you read the target file and the change is minimal;
+                                prefer customer/OEM path; else describe the change in words or N/A.
                                 (a full-file-grounded diff is generated automatically after this)
-## Unit test ideas
+## Unit test ideas            — concrete test names + assertions using existing AAOS patterns
+                                (Car test utils, mock VHAL, power-policy simulation). No new frameworks.
 ## needs_human_review: true/false
+   MUST be true if the change touches VHAL, VSS, power, SELinux, or AIDL.
 """)
     spec_notes = format_specialist_notes(state.get("specialist_notes") or [])
     sys_with_specialists = SYSTEM + spec_notes

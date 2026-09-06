@@ -479,3 +479,14 @@ order, preferred fix locations) were moved into `skills/android_automotive.md`
 where framework knowledge belongs.
 
 `hints/` stays clean for true OEM overlays only.
+
+---
+
+# Update 22 — Align finalize / few-shot / system with patch_and_ut
+
+- agent/nodes.py finalize prompt now references skills/patch_and_ut.md and
+  asks for concrete UT ideas (AAOS patterns only) + forced human-review wording.
+- prompts/fewshot_localize.md: added Example 3 (localization + minimal patch
+  description + named UT ideas) for the ignition/resume speed case.
+- prompts/system.md and skills/AGENTS.md aligned with patch_and_ut compliance
+  and customer-first fix location rules.
