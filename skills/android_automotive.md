@@ -38,6 +38,28 @@ trace the same chain in reverse (set path).
 ## Step 3 — match symptom to common suspects
 - **Not updating after ignition/resume/power state** → subscription/callback not re-registered on
   resume; power-policy listener; CarService lifecycle. Look at register/subscribe + power handlers.
+
+  Common on A15 when mapping is correct and VHAL is still publishing:
+  1. Client did not re-register `CarPropertyManager.registerCallback` / `registerListener`
+     after the Car connection or process was torn down by power policy.
+  2. CarService drops or does not re-deliver subscriptions across the power transition.
+  3. Foreground-service / binder death / process lifecycle kills the listener (A15 stricter rules).
+
+  Diagnostic order (do not skip):
+  1. Confirm VSS→VHAL mapping is correct.
+  2. Confirm VHAL is emitting after ignition.
+  3. Confirm CarPropertyService received the value.
+  4. Check whether the *client* still has an active registration after resume
+     (register calls only in onCreate/onStart and never re-issued in power / lifecycle listeners).
+
+  Preferred fix locations (customer-first):
+  - OEM HMI / settings app: re-register inside power-policy listener or onResume / after Car reconnect.
+    Prefer a single helper used by both initial registration and re-registration.
+  - Only if the drop is inside CarService: power-policy handlers + subscription bookkeeping.
+
+  Do not change the VSS mapping or DefaultProperties.json when mapping + VHAL emission are already correct.
+  Do not replace the event-driven subscription with polling.
+
 - **Wrong/empty value for a signal** → VSS→VHAL mapping (wrong property id / areaId / name), or
   VHAL default config.
 - **NPE opening a settings/seat/zone page** → null areaId for single-zone; missing RRO/config overlay.
