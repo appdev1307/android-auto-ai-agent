@@ -48,6 +48,8 @@ class StoreManifest:
     embed_model: str
     count: int = 0
     git_sha: str | None = None
+    index_roots: list[str] | None = None   # roots actually indexed (exact-search parity)
+    scope: str | None = None               # scope preset used at index time
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2)
@@ -58,7 +60,8 @@ class StoreManifest:
             return None
         d = json.loads(path.read_text())
         return cls(embed_model=d.get("embed_model", ""),
-                   count=d.get("count", 0), git_sha=d.get("git_sha"))
+                   count=d.get("count", 0), git_sha=d.get("git_sha"),
+                   index_roots=d.get("index_roots"), scope=d.get("scope"))
 
 
 # ── Repository interface ─────────────────────────────────────────

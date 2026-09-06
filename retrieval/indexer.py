@@ -236,10 +236,20 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
         with open(bm25_path, "wb") as f:
             pickle.dump(bm, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # Manifest — records the SHA we indexed, so next run can diff against it.
-    manifest = StoreManifest(embed_model=rag["embed_model"], count=total_chunks, git_sha=new_sha)
+    # Manifest — records the SHA we indexed (so next run can diff against it) and
+    # the roots we ACTUALLY indexed (so the retriever's exact/ripgrep channel greps
+    # the same scope instead of a divergent legacy list). Incremental keeps the
+    # scope the store was originally built with.
+    if do_incremental:
+        used_roots = prev.index_roots if prev else None
+        used_scope = prev.scope if prev else None
+    else:
+        used_roots = index_roots
+        used_scope = scope or rag.get("default_scope", "automotive")
+    manifest = StoreManifest(embed_model=rag["embed_model"], count=total_chunks,
+                             git_sha=new_sha, index_roots=used_roots, scope=used_scope)
     (store_dir / "manifest.json").write_text(manifest.to_json())
-    print(f"Done. chunks={total_chunks}  store={store_dir}  git_sha={new_sha}")
+    print(f"Done. chunks={total_chunks}  store={store_dir}  git_sha={new_sha}  scope={used_scope}")
 
 
 if __name__ == "__main__":

@@ -180,12 +180,29 @@ class HybridRetriever:
             h["rank"] = rank
         return hits
 
+    def _index_roots(self) -> list[str]:
+        """Roots for the exact/ripgrep channel. Prefer what was ACTUALLY indexed
+        (recorded in the store manifest) so exact-search matches the vectorized
+        scope; fall back to the config scope preset, then the legacy flat list."""
+        man = None
+        try:
+            man = self.store.manifest() if self.store else None
+        except Exception:
+            man = None
+        if man is not None and getattr(man, "index_roots", None):
+            return man.index_roots
+        scopes = self.rag.get("scopes") or {}
+        name = self.rag.get("default_scope") or "automotive"
+        if name in scopes:
+            return scopes[name]
+        return self.rag.get("index_roots") or ["."]
+
     def _exact_search(self, query: str, k: int) -> list[dict]:
         keywords = self._keywords(query)
         if not keywords or not self.aosp_root.exists():
             return []
         pattern = "|".join(re.escape(w) for w in keywords[:8])
-        roots = self.rag.get("index_roots") or ["."]
+        roots = self._index_roots()
         hits = []
         rank = 0
         for rel in roots:
