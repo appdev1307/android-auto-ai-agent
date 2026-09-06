@@ -83,6 +83,11 @@ python -m agent.main --aosp-root $AOSP_ROOT --aosp-version aosp15 \
 Output: ranked candidate files (by layer), a root-cause hypothesis, a proposed unified
 diff (or N/A), and a `needs_human_review` flag.
 
+With no `--customer`, the agent runs **base-only**: it loads the shared `_base` store
+from step 3 via the config `default_tenant` (customer `base`). If that store isn't built
+yet it falls back to the legacy flat index (`rag.index_dir`) instead. Pass `--customer`
+to add a customer overlay (see *Multi-tenant knowledge* below).
+
 ---
 
 ## Index scope (choose at runtime, not hard-coded)
@@ -227,7 +232,9 @@ Four layers wired through `AgentState`: **graph** (LangGraph orchestration), **t
 
 - **Dense**: sentence-transformers embeddings over structural chunks (Chroma, cosine)
 - **Sparse**: BM25 over the same chunks
-- **Exact**: ripgrep on the same roots (catches rare symbols embeddings miss)
+- **Exact**: ripgrep over the roots that were actually indexed — recorded in the store
+  manifest (`index_roots`/`scope`) so exact-search matches the vectorized scope instead of
+  a divergent hard-coded list (catches rare symbols embeddings miss)
 - **Fuse**: RRF (rank-based, scale-free) → **min-max normalize to [0,1]** → additive
   customer/OEM + layer priors → cross-encoder rerank with **sigmoid-normalized** CE scores
   blended against the prior-boosted base — so the customer-first boost survives rerank
@@ -240,7 +247,11 @@ Four layers wired through `AgentState`: **graph** (LangGraph orchestration), **t
 - `should_index(path, mode)` — `base` mode drops prebuilts/test/external/generated/oversized;
   `customer` mode keeps almost everything (customer patches land anywhere).
 - `--incremental` — `git diff` the tree's HEAD against the last indexed SHA and touch only
-  changed/added/deleted files in both Chroma and BM25 (pure local diff; no fetching).
+  changed/added/deleted files in both Chroma and BM25 (pure local diff; no fetching). Changed
+  files are filtered to the same scope roots recorded in the manifest, so incremental and a
+  full build stay in sync.
+- The manifest (`manifest.json`) records `embed_model`, `git_sha`, and the `index_roots`/`scope`
+  used — reused by the embed-model guard, incremental diffs, and exact-search root resolution.
 
 ### Tools (`agent/tools_def.py`)
 
@@ -270,7 +281,8 @@ Index a customer tree you fetched, then run the agent against it:
 ```bash
 python -m retrieval.indexer --aosp-root /oem/tree --customer oem-a --project proj1
 python -m agent.main --bug "..." --customer oem-a --project proj1 --aosp-version aosp15
-# omit --customer => base-only knowledge
+# omit --customer => base-only: loads _base via config default_tenant
+# (falls back to the legacy flat index if _base hasn't been built)
 ```
 
 A session only ever loads `_base` + **one** customer store, so another customer's code is
@@ -284,9 +296,11 @@ to root, embed-model mismatch raises.
 
 ## Config
 
-`data/config.yaml` — model endpoint, `stores_root`, index roots, embed model, ranking weights
-(`ce_blend`, `prior_customer`, `prior_customer_store`, `prior_hidl_penalty`), `max_tool_iters`,
-safety (`auto_apply: false`). Swap the embed model to a code-embedding model when you can afford it.
+`data/config.yaml` — model endpoint, `stores_root`, `default_tenant` (the tenant used when
+`--customer` is omitted; `customer: base` => base-only), index roots, embed model, ranking
+weights (`ce_blend`, `prior_customer`, `prior_customer_store`, `prior_hidl_penalty`),
+`max_tool_iters`, safety (`auto_apply: false`). Swap the embed model to a code-embedding model
+when you can afford it.
 
 ---
 
