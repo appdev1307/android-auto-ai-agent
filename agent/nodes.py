@@ -297,17 +297,23 @@ Provide:
     # arbitrary one from the process-wide cache — picking from the cache set can
     # grab another tenant's retriever and read the wrong customer's tree.
     r = get_retriever()
+    source_mounted = bool(getattr(r, "source_present", False)) if r is not None else False
     verified, unverified = [], []
     for p in dict.fromkeys(_extract_candidate_paths(text)):
-        exists = False
-        if r is not None:
-            probe = r.read_file(p, max_chars=1)
-            exists = not probe.startswith("[error") and not probe.startswith("[refused")
+        if not source_mounted:
+            # Index-only mode: the tree isn't on disk, so existence can't be
+            # checked. Paths came from tool results — don't cry "hallucination".
+            verified.append(p)
+            continue
+        probe = r.read_file(p, max_chars=1)
+        exists = not probe.startswith("[error") and not probe.startswith("[refused")
         (verified if exists else unverified).append(p)
 
     if unverified:
         text += "\n\n> ⚠ Unverified paths (not found in tree, possible hallucination): " \
                 + ", ".join(unverified)
+    elif verified and not source_mounted:
+        text += "\n\n> ℹ Candidate paths not checked against a tree (index-only mode)."
 
     # --- #1 Full-file context: regenerate the diff against the REAL full file ---
     # The first pass drafts a diff from ~1200-char chunks, so its context lines
