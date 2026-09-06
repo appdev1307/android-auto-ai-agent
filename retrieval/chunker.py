@@ -361,7 +361,7 @@ def _looks_like_vss(data) -> bool:
     if "Vehicle" in data:
         return True
     # COVESA .vspec: flat dotted keys like "Vehicle.Speed:" -> {datatype/type/unit/...}
-    if any("." in k and isinstance(v, dict) for k, v in data.items()):
+    if any(isinstance(k, str) and "." in k and isinstance(v, dict) for k, v in data.items()):
         return True
     blob = str(data)[:4000]
     return ('"children"' in blob or "'children'" in blob or "datatype" in blob)
@@ -372,7 +372,7 @@ def _vspec_flat_leaves(data) -> list[tuple]:
     Keep the ones that look like actual signals (have a datatype)."""
     out = []
     for key, val in data.items():
-        if not isinstance(val, dict) or "." not in key:
+        if not isinstance(key, str) or not isinstance(val, dict) or "." not in key:
             continue
         if "datatype" in val or val.get("type") in ("sensor", "actuator", "attribute"):
             keep = {k: val[k] for k in ("type", "datatype", "unit", "description",

@@ -433,3 +433,14 @@ chunker.py: COVESA files use the `.vspec` extension with a flat dotted-key forma
   `#include` lines are YAML comments so they're ignored. Nested-tree VSS (JSON/OEM catalog)
   still handled by the existing walker.
 Verified: a COVESA .vspec is indexable and chunked per-signal (Vehicle.Speed, Seat.Row1.Pos).
+
+---
+
+# Update 18 — Fix: VSS chunker crashed on non-string YAML keys
+
+`_looks_like_vss` / `_vspec_flat_leaves` did `"." in k` assuming string keys, but YAML
+parses bare `true/false/on/off/yes/no`, numbers, and `null` as bool/int/None keys →
+`TypeError: argument of type 'bool' is not iterable`, which killed a full index run at a
+random config file. Guarded both with `isinstance(key, str)`.
+Stress-tested against bool/number/None/list keys, empty dict, nested — no crash; VSS
+(json tree + COVESA .vspec) still chunks per-signal.
