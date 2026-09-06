@@ -329,7 +329,7 @@ class HybridRetriever:
         return hits[:top_k]
 
     # ------------------------------------------------------------------ utils
-    def read_file(self, path: str, max_chars: int | None = None) -> str:
+    def read_file(self, path: str, max_chars: int | None = None, add_marker: bool = True) -> str:
         max_chars = max_chars or self.cfg.get("retrieval", {}).get("max_file_chars", 14000)
         p = Path(path)
         if not p.is_absolute():
@@ -346,7 +346,8 @@ class HybridRetriever:
         try:
             text = p.read_text(encoding="utf-8", errors="ignore")
             if len(text) > max_chars:
-                return text[:max_chars] + "\n\n... [truncated] ..."
+                tail = "\n\n... [truncated] ..." if add_marker else ""
+                return text[:max_chars] + tail
             return text
         except Exception as e:
             return f"[error reading {path}: {e}]"

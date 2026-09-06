@@ -212,7 +212,8 @@ def _extract_first_diff(text: str) -> str:
 PATCH_MAX_TRIES = int(CFG.get("agent", {}).get("patch_max_tries", 2))
 
 
-def _grounded_patch_loop(full: str, top: str, bug: str, summary: str) -> tuple[str, str]:
+def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
+                         truncated: bool = False) -> tuple[str, str]:
     """Generate a unified diff, apply it in-memory to the real file, parse-check
     the result with tree-sitter, and on any syntax/apply error feed the concrete
     problem back and regenerate (up to patch_max_tries). This is the C4
@@ -224,7 +225,9 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str) -> tuple[s
     """
     from pathlib import Path as _P
     suffix = _P(top).suffix
-    trunc = "\n... [truncated] ..." if len(full) >= 24000 else ""
+    # Marker shown to the MODEL only (so it knows the file is cut); it is NOT in
+    # `full`, so it never reaches apply_unified_diff / parse_ok.
+    trunc = "\n... [file truncated for context] ..." if truncated else ""
     last_err = None
     patch_text = "N/A"
     for _ in range(PATCH_MAX_TRIES + 1):
@@ -247,6 +250,12 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str) -> tuple[s
         if patched is None:
             last_err = "the diff did not apply (a hunk's context did not match the file)."
             continue
+        # A truncated file is syntactically incomplete, so parse_ok would always
+        # false-fail. If the diff applied to the visible portion, accept it but
+        # be honest that syntax wasn't verified.
+        if truncated:
+            return patch_text, ("File too large to load fully; diff applies to the "
+                                "visible portion but syntax was not verified — verify on a real build.")
         ok, errs = parse_ok(patched, suffix)
         if ok:
             return patch_text, ""  # clean: applies + parses
@@ -284,8 +293,10 @@ Provide:
     needs_review = bool(touches_sensitive) or (not model_says_ok)
 
     # Path grounding: flag any candidate file that doesn't exist in the tree.
-    retriever = set(_RETRIEVER_CACHE.values())
-    r = next(iter(retriever), None)
+    # Use the ACTIVE retriever for this run (set in init_retriever), not an
+    # arbitrary one from the process-wide cache — picking from the cache set can
+    # grab another tenant's retriever and read the wrong customer's tree.
+    r = get_retriever()
     verified, unverified = [], []
     for p in dict.fromkeys(_extract_candidate_paths(text)):
         exists = False
@@ -306,10 +317,16 @@ Provide:
     if r is not None and "@@" in text and verified:
         if getattr(r, "source_present", True):
             top = verified[0]
-            full = r.read_file(top, max_chars=24000)
+            budget = 24000
+            # Read WITHOUT the truncation marker: the marker text would land
+            # inside the file we apply/parse and make tree-sitter fail on every
+            # large file. len == budget means the real file is bigger (truncated).
+            full = r.read_file(top, max_chars=budget, add_marker=False)
             if not full.startswith("[error") and not full.startswith("[refused"):
+                truncated = len(full) >= budget
                 patch_text, syntax_note = _grounded_patch_loop(
-                    full, top, state.get("bug_report", ""), text[:1500])
+                    full, top, state.get("bug_report", ""), text[:1500],
+                    truncated=truncated)
                 text += "\n\n## Patch (grounded in full file: " + top + ")\n" + patch_text
                 if syntax_note:
                     text += "\n\n> ⚠ " + syntax_note
