@@ -111,6 +111,20 @@ def _resolve_scope_roots(rag: dict, scope: str | None) -> list[str]:
     return rag.get("index_roots") or ["packages/services/Car", "hardware/interfaces/automotive"]
 
 
+def _under_roots(p: Path, root: Path, roots: list[str]) -> bool:
+    """True if file `p` sits under any of the (relative) scope `roots` of `root`.
+    scope 'full' uses ['.'] → matches the whole tree."""
+    try:
+        rp = p.resolve()
+    except Exception:
+        return False
+    for rel in roots:
+        base = (root if rel == "." else root / rel).resolve()
+        if base == rp or base in rp.parents:
+            return True
+    return False
+
+
 def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
                 base: bool = False, customer: str | None = None,
                 project: str = "default", aosp_version: str = "aosp15",
@@ -183,9 +197,16 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
 
     if do_incremental:
         changed, deleted = diff
-        changed = [p for p in changed if should_index(p, mode=mode)]  # re-apply tier filter
+        # Scope parity: the full build only indexes files under the scope roots,
+        # so incremental must too — otherwise a change OUTSIDE scope (e.g. in
+        # frameworks/av when the store is `automotive`) leaks into the index and
+        # full vs incremental diverge. Roots come from the manifest (recorded at
+        # build time); fall back to resolving the store's scope from config.
+        scope_roots = prev.index_roots or _resolve_scope_roots(rag, prev.scope or scope)
+        changed = [p for p in changed
+                   if should_index(p, mode=mode) and _under_roots(p, root, scope_roots)]
         print(f"[incremental] {prev.git_sha[:8]}→{new_sha[:8]}  "
-              f"changed={len(changed)} deleted={len(deleted)}")
+              f"changed={len(changed)} deleted={len(deleted)} scope_roots={len(scope_roots)}")
 
         # 1) drop old chunks of every touched file (changed OR deleted) from both stores
         touched = {str(p.resolve()) for p in (changed + deleted)}

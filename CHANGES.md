@@ -490,3 +490,52 @@ where framework knowledge belongs.
   description + named UT ideas) for the ignition/resume speed case.
 - prompts/system.md and skills/AGENTS.md aligned with patch_and_ut compliance
   and customer-first fix location rules.
+
+---
+
+# Update 23 — Correctness / hardening pass (6 fixes)
+
+Post-review bugfix batch. Three shipped first (patch-oracle / finalize retriever /
+exact-scope), three follow (incremental scope / index-only paths / read guard).
+
+## 1. Patch oracle no longer false-fails on large files
+`read_file` gained `add_marker`; `finalize` reads the grounding file WITHOUT the
+`... [truncated] ...` marker so it never reaches `apply_unified_diff` / `parse_ok`.
+Files >24k chars used to guarantee a fake syntax error → 2 dead retries → forced
+review. Now: file fits → oracle runs as before; file truncated → diff applied to the
+visible portion, parse-check skipped, honest "verify on a real build" note.
+(`hybrid.py:read_file`, `nodes.py:_grounded_patch_loop`/`finalize`)
+
+## 2. finalize uses the ACTIVE retriever, not an arbitrary cached one
+`finalize` picked `next(iter(_RETRIEVER_CACHE.values()))` — in a multi-tenant process
+that could grab another tenant's retriever and read the wrong customer's tree. Now
+uses `get_retriever()` (the one set in `init_retriever`), matching `specialists`.
+Closes an agent-layer hole in the option-B isolation. (`nodes.py:finalize`)
+
+## 3. Exact/ripgrep channel greps the indexed scope
+`StoreManifest` now records `index_roots` + `scope` at build time; the retriever's
+`_index_roots()` reads them so ripgrep greps exactly what was vectorized instead of
+the legacy flat `index_roots`. Fallback: config scope preset → legacy list.
+(`store.py`, `indexer.py` manifest write, `hybrid.py:_exact_search`)
+
+## 4. Incremental index respects scope
+Incremental only re-applied `should_index` (tier filter), not the scope roots, so a
+change outside scope leaked into the store and full vs incremental diverged. Now
+filters changed files with `_under_roots()` against the manifest's scope roots.
+(`indexer.py`)
+
+## 5. No false "hallucinated path" in index-only mode
+`finalize` flagged EVERY candidate as "possible hallucination" when the source tree
+wasn't mounted (`read_file` can't confirm existence). Now: when `source_present` is
+False, paths aren't flagged (they came from tool results), just a light "not checked
+against a tree" note. (`nodes.py:finalize`)
+
+## 6. read_file path guard closed when aosp_root is "."
+The escape guard was disabled entirely when `aosp_root` defaulted to "." (unset),
+letting an LLM-supplied absolute path (e.g. /etc/passwd) be read. Now an unset root
+confines reads to the working directory and refuses absolute / parent-escaping paths.
+(`hybrid.py:read_file`)
+
+Verified: all touched files compile; truncation + manifest round-trip + scope-root
+resolution checked in isolation. Not run end-to-end (no GPU / AOSP tree / heavy deps
+in the review env).

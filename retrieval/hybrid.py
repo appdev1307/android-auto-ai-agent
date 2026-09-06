@@ -356,7 +356,13 @@ class HybridRetriever:
         try:
             rp = p.resolve()
             root = self.aosp_root.resolve()
-            if root != Path(".").resolve() and root not in rp.parents and rp != root:
+            if root == Path(".").resolve():
+                # aosp_root not set — confine to the working directory; never
+                # serve an absolute or parent-escaping path the LLM supplied
+                # (e.g. /etc/passwd) just because root defaulted to ".".
+                if root not in rp.parents and rp != root:
+                    return f"[refused: {path} is outside the working directory]"
+            elif root not in rp.parents and rp != root:
                 return f"[refused: {path} is outside aosp_root]"
         except Exception:
             pass
