@@ -162,6 +162,70 @@ def _norm(s: str) -> str:
     return s.strip()
 
 
+_DIFF_CONT = ("diff --git", "index ", "--- ", "+++ ", "@@")
+
+
+def _strip_model_diffs(text: str, protect_from: str | None = None) -> tuple[str, bool]:
+    """Remove model-authored unified-diff blocks, replacing each with a prose note.
+
+    The ONLY unified diff we trust in a final report is the one produced by
+    `_grounded_patch_loop` — it was applied in-memory to the real full file and
+    parse-checked. Every other diff is a first-pass draft the model wrote from
+    ~1200-char chunks; its context lines are usually wrong and it must never be
+    presented as an apply-ready patch. This strips those drafts to prose.
+
+    `protect_from` is the exact grounded-patch marker string; text from that
+    marker onward is left untouched so the grounded patch survives. When it is
+    None (no grounded patch was produced), every diff in the text is stripped.
+
+    Returns (new_text, stripped). new_text is byte-identical to the input when
+    nothing was stripped.
+    """
+    if protect_from and protect_from in text:
+        head, rest = text.split(protect_from, 1)
+        tail = protect_from + rest
+    else:
+        head, tail = text, ""
+
+    lines = head.splitlines()
+    out: list[str] = []
+    stripped = False
+    i, n = 0, len(lines)
+    while i < n:
+        s = lines[i].lstrip()
+        # A real diff starts at `diff --git ...` or a `--- ` line immediately
+        # followed by `+++ ` (this avoids eating a markdown `---` rule or a
+        # `- bullet`, which never has a `+++ ` on the next line).
+        is_start = s.startswith("diff --git") or (
+            s.startswith("--- ") and i + 1 < n and lines[i + 1].lstrip().startswith("+++ ")
+        )
+        if not is_start:
+            out.append(lines[i]); i += 1; continue
+        # drop a fence we already emitted just above the diff
+        if out and out[-1].strip().startswith("```"):
+            out.pop()
+        seen_hunk = False
+        while i < n:
+            t = lines[i].lstrip()
+            if t.startswith(_DIFF_CONT):
+                seen_hunk = seen_hunk or t.startswith("@@")
+                i += 1; continue
+            # inside a hunk, body lines are ' '/'+'/'-' prefixed (or blank)
+            if seen_hunk and (lines[i][:1] in (" ", "+", "-") or lines[i] == ""):
+                i += 1; continue
+            break
+        # swallow the closing fence if present
+        if i < n and lines[i].strip().startswith("```"):
+            i += 1
+        out.append("_(draft diff removed — not grounded against the real file this "
+                   "run; see root cause and unit-test ideas above)_")
+        stripped = True
+
+    if not stripped:
+        return text, False
+    return ("\n".join(out) + tail), True
+
+
 def validate_diffs(text: str, read_file) -> list[str]:
     """Check every unified-diff hunk against the REAL file in the downloaded folder.
 
@@ -347,6 +411,7 @@ Provide:
     # are often wrong. If it proposed a diff, feed the top candidate's FULL
     # content and ask for a diff that applies cleanly against it. Bounded to one
     # file / ~24k chars so it fits the model's context window.
+    grounded_marker = None   # protects the grounded patch from the strip below
     if r is not None and "@@" in text and verified:
         if getattr(r, "source_present", True):
             top = verified[0]
@@ -360,14 +425,30 @@ Provide:
                 patch_text, syntax_note = _grounded_patch_loop(
                     full, top, state.get("bug_report", ""), text[:1500],
                     truncated=truncated)
-                text += "\n\n## Patch (grounded in full file: " + top + ")\n" + patch_text
+                marker = "\n\n## Patch (grounded in full file: " + top + ")\n"
+                if "@@" in patch_text:
+                    # A real, file-grounded diff — append it and protect it.
+                    text += marker + patch_text
+                    grounded_marker = marker
+                else:
+                    # Loop decided no change is warranted (N/A). No diff to keep.
+                    text += marker + "N/A — no minimal change warranted after " \
+                            "reading the full file."
                 if syntax_note:
                     text += "\n\n> ⚠ " + syntax_note
                     needs_review = True
         else:
             text += "\n\n> ⚠ Patch not grounded: source folder not mounted (index-only " \
-                    "mode). The draft diff above is from partial chunks — verify manually."
+                    "mode). Any draft diff is from partial chunks and is removed below."
             needs_review = True
+
+    # Hard guarantee: a model-authored (ungrounded) diff must never survive as an
+    # apply-ready patch. Strip every diff except the grounded one (protected by
+    # grounded_marker). When nothing could be grounded, all diffs become prose
+    # and the result is flagged for human review.
+    text, stripped_draft = _strip_model_diffs(text, protect_from=grounded_marker)
+    if stripped_draft and grounded_marker is None:
+        needs_review = True
 
     # Diff grounding: check each patch hunk against the real file in the folder.
     diff_problems = []
