@@ -132,9 +132,29 @@ tool_node = ToolNode(ALL_TOOLS)
 SENSITIVE = ("vhal", "vss", "selinux", "power", "aidl", "hardware/interfaces")
 
 
+_PATH_RE = re.compile(r"(?:^|\s)((?:[\w.\-]+/){1,}[\w.\-]+\.\w+)")
+_GIT_AB_PREFIX = re.compile(r"^[ab]/")
+
+# Unified-diff header lines. Their `--- a/<path>` / `+++ b/<path>` and
+# `diff --git a/<path> b/<path>` write paths with git's synthetic a//b/
+# prefixes; mining them yields bogus `a/<path>` / `b/<path>` "candidates" that
+# never resolve on disk and then get flagged as "possible hallucination"
+# against the tree (false positive). Candidate files come from the ranked list,
+# not from the diff, so we skip these lines entirely.
+_DIFF_HEADER_PREFIXES = ("--- ", "+++ ", "diff --git", "index ", "@@")
+
+
 def _extract_candidate_paths(text: str) -> list[str]:
-    # Grab path-ish tokens the model listed as candidate files.
-    return re.findall(r"(?:^|\s)((?:[\w.\-]+/){1,}[\w.\-]+\.\w+)", text)
+    # Grab path-ish tokens the model listed as candidate files, skipping
+    # unified-diff header lines and stripping any leftover git a//b/ prefix so a
+    # diff never manufactures phantom candidate paths.
+    out: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith(_DIFF_HEADER_PREFIXES):
+            continue
+        for m in _PATH_RE.findall(line):
+            out.append(_GIT_AB_PREFIX.sub("", m))
+    return out
 
 
 def _norm(s: str) -> str:
