@@ -15,7 +15,7 @@ from agent.state import AgentState
 from agent.tools_def import ALL_TOOLS, set_retriever, get_retriever
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
-from retrieval.chunker import apply_unified_diff, parse_ok, grammar_missing, guess_layer
+from retrieval.chunker import apply_unified_diff, parse_ok, grammar_missing, guess_layer, clang_format_check
 from agent.specialists import make_specialists_node, format_specialist_notes
 
 
@@ -293,6 +293,77 @@ def _extract_first_diff(text: str) -> str:
     return text if "@@" in text else ""
 
 
+# gtest/gmock/std/binder scaffolding + language keywords a test legitimately
+# introduces — these are NOT "invented" symbols and must never be flagged.
+_UT_SCAFFOLD = {
+    "TEST", "TEST_F", "TEST_P", "EXPECT_CALL", "EXPECT_EQ", "EXPECT_NE", "EXPECT_TRUE",
+    "EXPECT_FALSE", "EXPECT_THAT", "ASSERT_TRUE", "ASSERT_FALSE", "ASSERT_EQ", "ASSERT_NE",
+    "INSTANTIATE_TEST_SUITE_P", "RUN_ALL_TESTS", "MOCK_METHOD", "SetUp", "TearDown",
+    "TestWithParam", "ValuesIn", "GetParam", "PrintInstanceNameToString", "InitGoogleTest",
+    "Times", "Return", "WillOnce", "override", "public", "protected", "private", "namespace",
+    "nullptr", "void", "auto", "const", "using", "class", "struct", "include", "std", "make",
+    "testing", "true", "false", "NULL", "TRUE", "FALSE", "ndk", "ScopedAStatus", "descriptor",
+    "AServiceManager_waitForService", "ABinderProcess_startThreadPool", "fromBinder",
+    "SpAIBinder", "super", "this", "return", "new", "else", "for", "while", "switch", "case",
+    "break", "import", "package", "final", "static", "throws", "assertEquals", "assertTrue",
+    "assertNotNull", "verify", "when", "mock", "RunWith", "Before", "After",
+}
+
+
+def _patch_added_text(patch_text: str) -> str:
+    return "\n".join(l[1:] for l in patch_text.splitlines()
+                     if l.startswith("+") and not l.startswith("+++"))
+
+
+def _section(text: str, *header_needles: str) -> str:
+    """Return the body of the first `## ...` section whose header contains any of
+    the needles, up to the next `## ` header (or end)."""
+    lines = text.splitlines()
+    out, grabbing = [], False
+    for ln in lines:
+        if ln.lstrip().startswith("## "):
+            if grabbing:
+                break
+            grabbing = any(n.lower() in ln.lower() for n in header_needles)
+            continue
+        if grabbing:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def ut_consistency(source_text: str, patch_text: str, ut_text: str) -> list[str]:
+    """Check the generated unit test against the generated patch + real file.
+
+    Build-free, heuristic. Two signals:
+      (A) the test must reference at least one symbol the PATCH added/changed —
+          otherwise it doesn't exercise the fix (patch/test inconsistent).
+      (B) CONSTANT_CASE identifiers used in the test that appear in neither the
+          file nor the patch — likely invented (e.g. a wrong property id).
+    Test scaffolding (gtest/gmock/keywords) is excluded so it isn't mis-flagged.
+    """
+    if not ut_text.strip():
+        return []
+    tok = lambda s: set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", s))
+    src, ut = tok(source_text), tok(ut_text)
+    padd = tok(_patch_added_text(patch_text))
+    grounded = src | padd
+    problems: list[str] = []
+
+    patch_sig = {t for t in padd if t not in _UT_SCAFFOLD and len(t) > 3}
+    if patch_sig and not (patch_sig & ut):
+        problems.append("unit test references NONE of the patched symbols ("
+                        + ", ".join(sorted(patch_sig)[:6])
+                        + ") — it likely does not exercise the fix (patch/test inconsistent)")
+
+    ut_consts = {c for c in re.findall(r"\b[A-Z][A-Z0-9_]{3,}\b", ut_text)
+                 if c not in _UT_SCAFFOLD}
+    ungrounded = sorted(c for c in ut_consts if c not in grounded)
+    if ungrounded:
+        problems.append("unit test uses constant(s) not seen in the file or patch — "
+                        "verify they are real identifiers: " + ", ".join(ungrounded[:6]))
+    return problems
+
+
 PATCH_MAX_TRIES = int(CFG.get("agent", {}).get("patch_max_tries", 2))
 
 
@@ -349,10 +420,23 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
                 return patch_text, (f"Syntax NOT verified: no tree-sitter grammar for "
                                     f"'{suffix}' is installed here, so the parse-check was "
                                     f"skipped. Install the grammar or verify on a real build.")
-            return patch_text, ""  # clean: applies + parses
+            # Convention gate (C/C++): the added lines must be clang-format clean
+            # (AOSP style). On a violation, feed the concrete reformat back and
+            # regenerate; if clang-format isn't installed, say style wasn't
+            # enforced rather than pretending it passed.
+            cf_status, cf_probs = clang_format_check(full, patched, suffix,
+                                                     assume_filename=top)
+            if cf_status == "violations":
+                last_err = "the added C++ is not clang-format clean (AOSP style). " \
+                           + " ".join(cf_probs[1:])
+                continue
+            if cf_status == "unavailable":
+                return patch_text, ("Applies + parses, but C++ style NOT enforced: "
+                                    + cf_probs[0] + " — run clang-format or verify on a real build.")
+            return patch_text, ""  # clean: applies + parses + clang-format clean
         last_err = "applying it introduces a syntax error — " + "; ".join(errs[:3])
-    return patch_text, ("Generated patch still fails syntax/apply after retries: "
-                        + (last_err or "") + " Verify on a real build.")
+    return patch_text, ("Generated patch still fails validation (syntax/apply/style) "
+                        "after retries: " + (last_err or "") + " Verify on a real build.")
 
 
 def finalize(state: AgentState) -> Dict[str, Any]:
@@ -431,6 +515,8 @@ Provide:
     # content and ask for a diff that applies cleanly against it. Bounded to one
     # file / ~24k chars so it fits the model's context window.
     grounded_marker = None   # protects the grounded patch from the strip below
+    grounded_source = ""     # the real file we grounded against (for UT checking)
+    grounded_patch = ""
     if r is not None and "@@" in text and verified:
         if getattr(r, "source_present", True):
             top = verified[0]
@@ -449,6 +535,8 @@ Provide:
                     # A real, file-grounded diff — append it and protect it.
                     text += marker + patch_text
                     grounded_marker = marker
+                    grounded_source = full
+                    grounded_patch = patch_text
                 else:
                     # Loop decided no change is warranted (N/A). No diff to keep.
                     text += marker + "N/A — no minimal change warranted after " \
@@ -478,6 +566,18 @@ Provide:
                     + "\n>   - ".join(diff_problems) \
                     + "\n> Treat the patch as a described change, not an apply-ready diff."
             needs_review = True   # a non-applying diff must not be trusted
+
+    # Cross-module consistency: does the generated unit test actually exercise the
+    # generated patch, and does it avoid symbols found in neither the file nor the
+    # patch? Only meaningful when we produced a grounded patch to compare against.
+    if grounded_marker and grounded_patch:
+        ut_body = _section(text, "unit test", "unit-test")
+        ut_probs = ut_consistency(grounded_source, grounded_patch, ut_body)
+        if ut_probs:
+            text += "\n\n> ⚠ Unit test not consistent with the patch:\n>   - " \
+                    + "\n>   - ".join(ut_probs) \
+                    + "\n> Align the test with the patched symbols before trusting it."
+            needs_review = True
 
     return {
         "messages": [AIMessage(content=text)],
