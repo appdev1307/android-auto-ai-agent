@@ -539,3 +539,26 @@ confines reads to the working directory and refuses absolute / parent-escaping p
 Verified: all touched files compile; truncation + manifest round-trip + scope-root
 resolution checked in isolation. Not run end-to-end (no GPU / AOSP tree / heavy deps
 in the review env).
+
+---
+
+# Update 24 — Base-only loads the _base store without a flag (main.py default_tenant)
+
+Base-only runs (`--customer` omitted) previously returned ZERO hits: `main.py` set
+`tenant=None`, so `_init_store` fell back to the legacy flat `index_dir`
+(`indexes/chroma_aaos`, different collection name) instead of the multi-tenant `_base`
+store built by `--base`. The `default_tenant` in `config.yaml` was never read.
+
+`agent/main.py` now resolves the tenant (`_load_cfg` + `_resolve_tenant`):
+- `--customer <X>` → that tenant (unchanged; a customer overlay is still explicit).
+- `--customer` omitted → fall back to config `default_tenant` (customer `base`) and load
+  `<stores_root>/_base/<ver>` — but ONLY when that store exists on disk; otherwise return
+  `None` and keep the legacy flat index (backward-compat, no crash for pre-multitenant setups).
+
+Supersedes the Update 2 note "main.py — explicit, never auto-picked": a **customer** overlay is
+still never auto-picked, but base-only now auto-resolves to `default_tenant` so the index you
+built is actually used — `python -m agent.main --bug "..."` (no `--customer`) works out of the box.
+README (§5 Run, Multi-tenant, Config) updated to match.
+
+Verified: tenant-resolution branches (customer given / omit+_base exists / omit+no _base /
+omit+no stores_root) checked in isolation; `main.py` compiles.
