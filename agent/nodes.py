@@ -71,6 +71,7 @@ llm_with_tools = llm.bind_tools(ALL_TOOLS)
 SYSTEM = load_text("prompts/system.md") + "\n\n" + load_text("prompts/fewshot_localize.md")
 SYSTEM += "\n\n" + load_text("skills/AGENTS.md")
 SYSTEM += "\n\n" + load_text("skills/android_automotive.md")
+SYSTEM += "\n\n" + load_text("skills/patch_and_ut.md")
 SYSTEM += load_hints()   # custom hints from hints/*.md + config prompt.hint_files
 
 
