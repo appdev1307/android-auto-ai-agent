@@ -312,9 +312,13 @@ class HybridRetriever:
             if ext in {".aidl", ".java", ".kt", ".cpp", ".h", ".yaml", ".yml"}:
                 prior += 0.02
 
-            # Legacy HIDL: down-weight hard unless the query is explicitly
-            # about HIDL / migration. We keep these indexable (comparison,
-            # porting) but they must never outrank AIDL for an A14+ question.
+            # Legacy HIDL is already hard-dropped at index time
+            # (should_index -> is_hidl -> False), so in a normal base index there
+            # are no hidl_legacy hits here. This stays as a DEFENSIVE net for a
+            # hidl_legacy chunk that slipped in another way — a pre-existing/older
+            # index, a customer overlay that kept HIDL, or a content-detected
+            # `.bp` — so it can never outrank AIDL for an A14+ question, unless
+            # the query is explicitly about HIDL / migration.
             if h.get("layer") == "hidl_legacy":
                 if any(x in q for x in ("hidl", "migrat", "legacy", "v2_0", "2.0", ".hal")):
                     prior += 0.0

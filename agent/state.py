@@ -2,6 +2,8 @@ from typing import TypedDict, Annotated, List, Dict, Optional, Any
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 
+from agent.diagnosis import Diagnosis
+
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
@@ -10,7 +12,8 @@ class AgentState(TypedDict):
     aosp_root: Optional[str]
     tenant: Optional[Dict[str, str]]
     task_type: str
-    evidence: List[Dict[str, Any]]      # retrieval hits
+    evidence: List[Dict[str, Any]]      # retrieval hits actually gathered this run
+    diagnosis: Diagnosis                # committed single source of truth
     candidate_files: List[str]
     root_cause: Optional[str]
     patches: List[Dict[str, Any]]

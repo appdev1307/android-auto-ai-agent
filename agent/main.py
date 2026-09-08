@@ -119,6 +119,7 @@ def run(graph, bug: str, aosp_root: str | None, log: str | None, tenant: dict | 
         "tenant": tenant,
         "task_type": "localize_patch",
         "evidence": [],
+        "diagnosis": {},
         "candidate_files": [],
         "root_cause": None,
         "patches": [],
