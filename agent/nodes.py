@@ -15,8 +15,11 @@ from agent.state import AgentState
 from agent.tools_def import ALL_TOOLS, set_retriever, get_retriever
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
-from retrieval.chunker import apply_unified_diff, parse_ok, grammar_missing, guess_layer, clang_format_check
+from retrieval.chunker import (apply_unified_diff, parse_ok, grammar_missing, guess_layer,
+                               clang_format_check, symbol_window)
 from agent.specialists import make_specialists_node, format_specialist_notes
+from agent.diagnosis import (Diagnosis, collect_evidence, commit_diagnosis_record,
+                             render_diagnosis)
 
 
 def load_config() -> dict:
@@ -61,6 +64,13 @@ _kwargs = {
     "model": MODEL.get("name", "meta-llama/Llama-3.1-70B-Instruct"),
     "temperature": MODEL.get("temperature", 0.1),
     "api_key": API_KEY,
+    # Generation budget. The config value was previously NOT passed through, so
+    # the endpoint default applied — and on OpenAI-compatible backends like
+    # Ollama that default is small, silently truncating a patch/UT/commit-JSON
+    # mid-output. The thesis measured a single VHAL generation needing ~4302
+    # tokens against a 4096 cap, so we read it from config with generous
+    # headroom and no silent truncation.
+    "max_tokens": int(MODEL.get("max_tokens", 8192)),
 }
 if API_BASE:
     _kwargs["base_url"] = API_BASE
@@ -116,17 +126,65 @@ def agent_reason(state: AgentState) -> Dict[str, Any]:
     return {"messages": [resp], "status": "reasoning", "iterations": iters}
 
 
-def should_continue(state: AgentState) -> Literal["tools", "specialists"]:
+def should_continue(state: AgentState) -> Literal["tools", "commit"]:
     # Hard stop before LangGraph's recursion_limit turns into a crash.
     if int(state.get("iterations", 0)) >= MAX_TOOL_ITERS:
-        return "specialists"
+        return "commit"
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
         return "tools"
-    return "specialists"
+    return "commit"
 
 
 tool_node = ToolNode(ALL_TOOLS)
+
+
+_COMMIT_PROMPT = """You have finished gathering evidence with tools. Commit the diagnosis
+as STRICT JSON and nothing else — no prose, no markdown, no code fences.
+
+Use ONLY file paths, symbols, and identifiers that appear VERBATIM in the tool
+results above. Do not invent anything; unproven items will be dropped.
+
+JSON schema:
+{
+  "file": "<the single best file to patch, exact path from a tool result>",
+  "symbols": ["<method/callback/class central to the fix, seen in evidence>"],
+  "property_ids": ["<e.g. PERF_VEHICLE_SPEED, seen in evidence>"],
+  "root_cause": "<one sentence>",
+  "candidates": [
+    {"path": "<exact path from evidence>", "layer": "<your guess>", "why": "<short>"}
+  ]
+}
+Output the JSON object only."""
+
+
+def commit_diagnosis(state: AgentState) -> Dict[str, Any]:
+    """Turn the ReAct trail into a COMMITTED, code-validated diagnosis record.
+
+    The LLM proposes JSON; `commit_diagnosis_record` then keeps only what is
+    grounded in the evidence the agent actually gathered (paths/symbols/consts),
+    recomputes the layer from the path, and snaps git a//b/ prefixes. Everything
+    downstream (specialists, finalize, patch, UT) binds to this record instead of
+    re-deriving from prose."""
+    msgs = list(state.get("messages", []))
+    evidence = collect_evidence(msgs)
+    resp = llm.invoke([SystemMessage(content=SYSTEM)] + msgs
+                      + [HumanMessage(content=_COMMIT_PROMPT)])
+    raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+    dx = commit_diagnosis_record(raw, evidence, guess_layer)
+    # structured evidence for specialists to reuse (no independent re-retrieval)
+    ev_records = [{"path": p, "layer": guess_layer(p)} for p in evidence["paths"]]
+    return {
+        "diagnosis": dx,
+        "evidence": ev_records,
+        "status": "diagnosis_committed",
+        # not committed / grounding problems => a human must look
+        "needs_human_review": bool(state.get("needs_human_review"))
+                              or (not dx.get("committed"))
+                              or bool(dx.get("grounding_problems")),
+    }
+
+
 
 
 SENSITIVE = ("vhal", "vss", "selinux", "power", "aidl", "hardware/interfaces")
@@ -409,8 +467,10 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
         # false-fail. If the diff applied to the visible portion, accept it but
         # be honest that syntax wasn't verified.
         if truncated:
-            return patch_text, ("File too large to load fully; diff applies to the "
-                                "visible portion but syntax was not verified — verify on a real build.")
+            return patch_text, ("Large file: patch was generated against the "
+                                "symbol-anchored region (not the whole file), so syntax "
+                                "wasn't fully verified and hunk offsets are region-relative "
+                                "— apply with context matching and verify on a real build.")
         ok, errs = parse_ok(patched, suffix)
         if ok:
             # parse_ok returns ok=True both for "parsed cleanly" and for "no
@@ -439,152 +499,147 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
                         "after retries: " + (last_err or "") + " Verify on a real build.")
 
 
+_UT_PROMPT = """Finalize. No more tools. Follow skills/patch_and_ut.md.
+
+The diagnosis is ALREADY COMMITTED (below). Do NOT restate candidates or root
+cause, do NOT change the target file, and do NOT write a unified diff (the patch
+is generated separately and grounded against the real file).
+
+Produce ONLY this section:
+
+## Unit test ideas
+AAOS-native frameworks only (Java/HMI/CarService: JUnit4 + Robolectric or
+instrumentation; VHAL/native: GoogleTest + gmock; HAL: VTS when applicable).
+The test MUST exercise the committed symbols / property_ids below and reference
+ONLY names that appear in them or in the target file — do not invent API.
+For each test: Framework + TestName + setup/action/assert.
+"""
+
+ALWAYS_REVIEW_LAYERS = {"native", "vhal", "vss", "aidl", "hidl_legacy", "selinux"}
+
+
 def finalize(state: AgentState) -> Dict[str, Any]:
-    """Ask model for final structured summary without new tools."""
-    summary_prompt = HumanMessage(content="""Finalize now. No more tools.
-Follow skills/patch_and_ut.md for any patch or unit-test content.
+    """Render the COMMITTED diagnosis and bind the patch + unit test to it.
 
-HARD RULES:
-- Do NOT invent file paths.
-- Do NOT emit a unified diff (---/+++/@@) unless you read that exact file with
-  read_source in this run. Otherwise: Proposed patch (draft): N/A — words only.
-
-Provide:
-## Candidate files (ranked)   — one per line as `N. <full/path> [layer]`, only files seen in tool results
-## Root cause                 — grounded in retrieved snippets
-## Proposed patch (draft)     — unified diff ONLY if file was read and change is minimal;
-                                prefer customer/OEM path; else N/A + describe in words.
-## Unit test ideas            — AAOS-native frameworks only:
-                                Java/HMI/CarService: JUnit4 + Robolectric or instrumentation;
-                                VHAL/native: GoogleTest (gtest/gmock); HAL: VTS when applicable.
-                                For each: Framework + TestName + setup/action/assert.
-                                No new frameworks. No vague bullets.
-## needs_human_review: true/false
-   MUST be true if the change touches VHAL, VSS, power, SELinux, or AIDL.
-""")
-    spec_notes = format_specialist_notes(state.get("specialist_notes") or [])
-    sys_with_specialists = SYSTEM + spec_notes
-    messages = [SystemMessage(content=sys_with_specialists)] + list(state.get("messages", [])) + [summary_prompt]
-    resp = llm.invoke(messages)
-    text = resp.content if isinstance(resp.content, str) else str(resp.content)
-    low = text.lower()
-
-    # Model self-report, but never trust it downward on safety-critical layers.
-    model_says_ok = "needs_human_review: false" in low.replace("*", "").replace("`", "")
-    touches_sensitive = any(s in low for s in SENSITIVE)
-    needs_review = bool(touches_sensitive) or (not model_says_ok)
-
-    # Path grounding: flag any candidate file that doesn't exist in the tree.
-    # Use the ACTIVE retriever for this run (set in init_retriever), not an
-    # arbitrary one from the process-wide cache — picking from the cache set can
-    # grab another tenant's retriever and read the wrong customer's tree.
+    Candidates and root cause are no longer re-derived from prose — they are
+    rendered from the committed `diagnosis` record. The LLM only writes the unit
+    test (bound to the committed symbols); the patch comes from the grounded
+    loop on the committed file. All oracles still run as a double-check.
+    """
+    dx = state.get("diagnosis") or {}
     r = get_retriever()
-    source_mounted = bool(getattr(r, "source_present", False)) if r is not None else False
-    verified, unverified = [], []
-    for p in dict.fromkeys(_extract_candidate_paths(text)):
-        if not source_mounted:
-            # Index-only mode: the tree isn't on disk, so existence can't be
-            # checked. Paths came from tool results — don't cry "hallucination".
-            verified.append(p)
-            continue
-        probe = r.read_file(p, max_chars=1)
-        exists = not probe.startswith("[error") and not probe.startswith("[refused")
-        (verified if exists else unverified).append(p)
+    needs_review = bool(state.get("needs_human_review"))
 
-    if unverified:
-        text += "\n\n> ⚠ Unverified paths (not found in tree, possible hallucination): " \
-                + ", ".join(unverified)
-    elif verified and not source_mounted:
-        text += "\n\n> ℹ Candidate paths not checked against a tree (index-only mode)."
+    # 1) The committed diagnosis IS the candidate list + root cause (source of truth).
+    text = render_diagnosis(dx)
+    spec_notes = format_specialist_notes(state.get("specialist_notes") or [])
+    text += spec_notes
 
-    # Safety-critical layers ALWAYS require a human, checked against the actual
-    # candidate paths (not a prose substring: "alternative" contains "native").
-    # A native service, VHAL, VSS, AIDL or legacy-HIDL file among the candidates
-    # forces review even if the model self-reported needs_human_review: false.
-    ALWAYS_REVIEW_LAYERS = {"native", "vhal", "vss", "aidl", "hidl_legacy"}
-    candidate_layers = {guess_layer(p) for p in (verified + unverified)}
-    critical = candidate_layers & ALWAYS_REVIEW_LAYERS
+    # 2) Unit test — LLM writes it, bound to the committed facts only.
+    facts = (f"Committed diagnosis:\n- file: {dx.get('file')}\n"
+             f"- layer: {dx.get('layer')}\n"
+             f"- symbols: {', '.join(dx.get('symbols') or []) or '(none)'}\n"
+             f"- property_ids: {', '.join(dx.get('property_ids') or []) or '(none)'}\n"
+             f"- root_cause: {dx.get('root_cause')}")
+    try:
+        resp = llm.invoke([SystemMessage(content=SYSTEM + spec_notes),
+                           HumanMessage(content=facts),
+                           HumanMessage(content=_UT_PROMPT)])
+        ut_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    except Exception:
+        ut_text = "## Unit test ideas\n_(unit test generation unavailable)_"
+    text += "\n\n" + ut_text
+
+    # 3) Safety-critical layers ALWAYS require a human — from the committed layers.
+    committed_layers = {dx.get("layer", "")} | {c.get("layer", "")
+                                                for c in dx.get("candidates", []) or []}
+    critical = committed_layers & ALWAYS_REVIEW_LAYERS
     if critical:
         needs_review = True
-        text += "\n\n> ⚠ Human review required: candidates touch safety-critical " \
-                "layer(s): " + ", ".join(sorted(critical)) + "."
+        text += "\n\n> ⚠ Human review required: touches safety-critical layer(s): " \
+                + ", ".join(sorted(critical)) + "."
 
-    # --- #1 Full-file context: regenerate the diff against the REAL full file ---
-    # The first pass drafts a diff from ~1200-char chunks, so its context lines
-    # are often wrong. If it proposed a diff, feed the top candidate's FULL
-    # content and ask for a diff that applies cleanly against it. Bounded to one
-    # file / ~24k chars so it fits the model's context window.
-    grounded_marker = None   # protects the grounded patch from the strip below
-    grounded_source = ""     # the real file we grounded against (for UT checking)
+    # Power/SELinux safety net: some sensitive concerns aren't a clean file layer
+    # (power management is spread across CarService + policy XML). Check the
+    # COMMITTED facts only (file path + root cause), not the whole prose, so this
+    # can't false-fire on an unrelated word elsewhere in the report.
+    committed_text = (dx.get("file", "") + " " + (dx.get("root_cause") or "")).lower()
+    if any(k in committed_text for k in ("selinux", "sepolicy", "power")):
+        needs_review = True
+
+    # 4) Patch — generated ONLY against the committed, grounded file.
+    grounded_marker = None
+    grounded_source = ""
     grounded_patch = ""
-    if r is not None and "@@" in text and verified:
+    target = dx.get("file", "")
+    if r is not None and dx.get("committed") and target:
         if getattr(r, "source_present", True):
-            top = verified[0]
             budget = 24000
-            # Read WITHOUT the truncation marker: the marker text would land
-            # inside the file we apply/parse and make tree-sitter fail on every
-            # large file. len == budget means the real file is bigger (truncated).
-            full = r.read_file(top, max_chars=budget, add_marker=False)
+            # Read the whole file (big cap), then window on the committed symbols
+            # so the model sees the code that actually changes even when it sits
+            # past the first `budget` chars — instead of a blind first-N slice.
+            full = r.read_file(target, max_chars=400000, add_marker=False)
             if not full.startswith("[error") and not full.startswith("[refused"):
-                truncated = len(full) >= budget
+                window, windowed = symbol_window(full, dx.get("symbols") or [], budget)
                 patch_text, syntax_note = _grounded_patch_loop(
-                    full, top, state.get("bug_report", ""), text[:1500],
-                    truncated=truncated)
-                marker = "\n\n## Patch (grounded in full file: " + top + ")\n"
+                    window, target, state.get("bug_report", ""),
+                    dx.get("root_cause", ""), truncated=windowed)
+                marker = "\n\n## Patch (grounded in full file: " + target + ")\n"
                 if "@@" in patch_text:
-                    # A real, file-grounded diff — append it and protect it.
                     text += marker + patch_text
                     grounded_marker = marker
-                    grounded_source = full
+                    grounded_source = window
                     grounded_patch = patch_text
                 else:
-                    # Loop decided no change is warranted (N/A). No diff to keep.
                     text += marker + "N/A — no minimal change warranted after " \
                             "reading the full file."
                 if syntax_note:
                     text += "\n\n> ⚠ " + syntax_note
                     needs_review = True
         else:
-            text += "\n\n> ⚠ Patch not grounded: source folder not mounted (index-only " \
-                    "mode). Any draft diff is from partial chunks and is removed below."
+            text += "\n\n> ⚠ Patch not grounded: source folder not mounted " \
+                    "(index-only mode) — verify manually."
             needs_review = True
+    elif not dx.get("committed"):
+        text += "\n\n> ⚠ Diagnosis is not grounded to a real file — no patch " \
+                "generated; human review required."
+        needs_review = True
 
-    # Hard guarantee: a model-authored (ungrounded) diff must never survive as an
-    # apply-ready patch. Strip every diff except the grounded one (protected by
-    # grounded_marker). When nothing could be grounded, all diffs become prose
-    # and the result is flagged for human review.
+    # 5) Strip any stray model-authored diff (e.g. if the UT LLM slipped one in);
+    #    the grounded patch is protected.
     text, stripped_draft = _strip_model_diffs(text, protect_from=grounded_marker)
     if stripped_draft and grounded_marker is None:
         needs_review = True
 
-    # Diff grounding: check each patch hunk against the real file in the folder.
-    diff_problems = []
+    # 6) Diff grounding: every surviving hunk must match the real file.
     if r is not None and ("@@" in text or "--- " in text):
         diff_problems = validate_diffs(text, r.read_file)
         if diff_problems:
             text += "\n\n> ⚠ Diff did not validate against the source folder:\n>   - " \
                     + "\n>   - ".join(diff_problems) \
                     + "\n> Treat the patch as a described change, not an apply-ready diff."
-            needs_review = True   # a non-applying diff must not be trusted
+            needs_review = True
 
-    # Cross-module consistency: does the generated unit test actually exercise the
-    # generated patch, and does it avoid symbols found in neither the file nor the
-    # patch? Only meaningful when we produced a grounded patch to compare against.
+    # 7) Cross-module consistency: does the unit test exercise the patch and avoid
+    #    invented symbols? Checked against the committed source + grounded patch.
     if grounded_marker and grounded_patch:
         ut_body = _section(text, "unit test", "unit-test")
-        ut_probs = ut_consistency(grounded_source, grounded_patch, ut_body)
+        # committed symbols/property_ids count as grounded even if defined elsewhere
+        source_plus = grounded_source + "\n" + " ".join(
+            (dx.get("symbols") or []) + (dx.get("property_ids") or []))
+        ut_probs = ut_consistency(source_plus, grounded_patch, ut_body)
         if ut_probs:
             text += "\n\n> ⚠ Unit test not consistent with the patch:\n>   - " \
                     + "\n>   - ".join(ut_probs) \
-                    + "\n> Align the test with the patched symbols before trusting it."
+                    + "\n> Align the test with the committed symbols before trusting it."
             needs_review = True
 
     return {
         "messages": [AIMessage(content=text)],
         "status": "completed",
         "needs_human_review": needs_review,
-        "root_cause": text[:2000],
-        "candidate_files": verified,
+        "root_cause": dx.get("root_cause") or text[:2000],
+        "candidate_files": [c["path"] for c in dx.get("candidates", []) or []],
     }
 
 

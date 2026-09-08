@@ -25,6 +25,7 @@ _LAYER_FILE = {
     "vss": "vss.md",
     "customer": "hmi.md",   # OEM overlay: treat with the HMI/app specialist by default
     "native": "native.md",  # native services / non-vehicle HALs (C/C++)
+    "selinux": "selinux.md",  # sepolicy: .te / *_contexts / macros
 }
 
 MAX_SPECIALISTS = 3   # cap LLM calls per bug
@@ -36,41 +37,59 @@ def _load(fname: str) -> str:
 
 
 def make_specialists_node(llm, get_retriever):
-    """Factory: returns the graph node. `get_retriever()` yields the active
-    HybridRetriever (already set for this run); `llm` is the base chat model."""
+    """Factory: returns the graph node. Specialists now VALIDATE the committed
+    diagnosis for their layer using the evidence the agent already gathered — they
+    do NOT run their own retrieval, so they can't drift onto different files than
+    the committed record."""
 
     def specialists(state: "AgentState") -> Dict[str, Any]:  # noqa: F821
+        dx = state.get("diagnosis") or {}
         r = get_retriever()
-        if r is None:
-            return {"specialist_notes": []}
-        bug = state.get("bug_report", "") or ""
-        try:
-            hits = r.retrieve(bug, top_k=15)
-        except Exception:
-            return {"specialist_notes": []}
 
-        # group evidence by layer, preserving retrieval order
-        by_layer: dict[str, list] = {}
-        for h in hits:
-            by_layer.setdefault(h.get("layer", "other"), []).append(h)
+        # Which layers to consult: the committed target's layer + candidate layers.
+        layers: list[str] = []
+        if dx.get("layer"):
+            layers.append(dx["layer"])
+        for c in dx.get("candidates", []) or []:
+            if c.get("layer") and c["layer"] not in layers:
+                layers.append(c["layer"])
 
-        # consult specialists for the layers that actually have evidence + a prompt
+        # Evidence for a layer, taken from the committed record + gathered paths —
+        # read the real file content for the diagnosis target so the specialist
+        # judges the same bytes the patch will be built from.
+        committed_file = dx.get("file", "")
+        target_content = ""
+        if r is not None and committed_file:
+            try:
+                target_content = r.read_file(committed_file, max_chars=1600)
+            except Exception:
+                target_content = ""
+
         notes = []
         consulted = 0
-        for layer, lhits in by_layer.items():
+        for layer in layers:
             if layer not in _LAYER_FILE or consulted >= MAX_SPECIALISTS:
                 continue
             sys_prompt = _load(_LAYER_FILE[layer])
             if not sys_prompt:
                 continue
-            evidence = "\n\n".join(
-                f"FILE: {h.get('path')}\n{(h.get('content') or '')[:1200]}"
-                for h in lhits[:4]
+            facts = (
+                f"Committed diagnosis (single source of truth):\n"
+                f"- file: {dx.get('file')}\n"
+                f"- layer: {dx.get('layer')}\n"
+                f"- symbols: {', '.join(dx.get('symbols') or []) or '(none)'}\n"
+                f"- property_ids: {', '.join(dx.get('property_ids') or []) or '(none)'}\n"
+                f"- root_cause: {dx.get('root_cause')}\n\n"
+                f"Target file (excerpt):\n{target_content or '(not available)'}"
             )
             try:
                 resp = llm.invoke([
                     SystemMessage(content=sys_prompt),
-                    HumanMessage(content=f"Bug:\n{bug}\n\nEvidence for the {layer} layer:\n{evidence}"),
+                    HumanMessage(content=(
+                        f"Bug:\n{state.get('bug_report','')}\n\n{facts}\n\n"
+                        f"Validate this diagnosis for the {layer} layer. State: do you AGREE "
+                        f"the root cause and file are right for this layer? If not, what's "
+                        f"missing? Reference only the symbols/paths above — do not invent.")),
                 ])
                 txt = resp.content if isinstance(resp.content, str) else str(resp.content)
                 notes.append({"layer": layer, "assessment": txt.strip()})

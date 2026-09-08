@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 import re
+import shutil
+import difflib
+import subprocess
 from pathlib import Path
 from typing import Iterator
 
@@ -316,6 +319,107 @@ def grammar_missing(suffix: str) -> bool:
     return _get_parser(lang) is None
 
 
+def symbol_window(text: str, symbols: list[str], budget: int = 24000) -> tuple[str, bool]:
+    """Return a <=budget-char slice of `text` centered on the first line that
+    mentions one of `symbols`.
+
+    The grounded-patch loop can only fit ~budget chars of a file in the model's
+    context. Truncating from the START (`text[:budget]`) hides the buggy code
+    when it sits past that offset in a large file — so the model patches blind.
+    This instead anchors the window on the committed symbol(s), keeping a
+    contiguous region around the code that actually changes (AST-aware chunking
+    in the same spirit as BLAgent's path-augmented chunks). Falls back to the
+    head of the file when no symbol is found.
+
+    Returns (window, windowed). windowed=False means the whole file already fit
+    (no truncation); callers treat windowed=True like a truncated read (the diff
+    is region-relative and syntax can't be fully verified).
+    """
+    if len(text) <= budget:
+        return text, False
+    lines = text.splitlines()
+    toks = [s for s in (symbols or []) if s]
+    anchor = next((i for i, ln in enumerate(lines) if any(t in ln for t in toks)), None)
+    if anchor is None:
+        return text[:budget], True                      # head fallback (old behaviour)
+    lo = hi = anchor
+    size = len(lines[anchor]) + 1
+    while lo > 0 or hi < len(lines) - 1:
+        grew = False
+        if lo > 0 and size + len(lines[lo - 1]) + 1 <= budget:
+            lo -= 1
+            size += len(lines[lo]) + 1
+            grew = True
+        if hi < len(lines) - 1 and size + len(lines[hi + 1]) + 1 <= budget:
+            hi += 1
+            size += len(lines[hi]) + 1
+            grew = True
+        if not grew:
+            break
+    return "\n".join(lines[lo:hi + 1]), True
+
+
+_CPP_SUFFIXES = {".c", ".h", ".hh", ".hpp", ".cpp", ".cc", ".cxx"}
+# Fallback used ONLY when the source tree has no .clang-format of its own.
+# Must be a NAMED clang-format style (inline blobs are rejected by
+# -fallback-style). AOSP C++ is closest to the Google base; when the tree ships
+# its own .clang-format (AOSP does), -style=file uses THAT instead of this.
+_CF_FALLBACK = "Google"
+
+
+def _changed_line_ranges(original: str, patched: str) -> list[tuple[int, int]]:
+    """1-based inclusive line ranges in `patched` that the diff added/changed."""
+    o, p = original.splitlines(), patched.splitlines()
+    ranges: list[tuple[int, int]] = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(
+            a=o, b=p, autojunk=False).get_opcodes():
+        if tag in ("insert", "replace") and j2 > j1:
+            ranges.append((j1 + 1, j2))
+    return ranges
+
+
+def clang_format_check(original: str, patched: str, suffix: str,
+                       assume_filename: str | None = None) -> tuple[str, list[str]]:
+    """Style/convention oracle for C/C++ patches (AOSP clang-format).
+
+    Only the lines the patch ADDED/CHANGED are checked (via clang-format
+    --lines), so untouched legacy code in the file never trips the gate. Style
+    comes from the source tree's own .clang-format when found (`-style=file` +
+    `-assume-filename`), falling back to an AOSP-ish Google/4-space base.
+
+      ("ok", [])            conforms, or nothing C/C++ to check
+      ("violations", [...]) clang-format would reformat the new code (not clean)
+      ("unavailable", [..]) clang-format not installed / errored -> NOT enforced
+    """
+    if suffix.lower() not in _CPP_SUFFIXES:
+        return "ok", []
+    ranges = _changed_line_ranges(original, patched)
+    if not ranges:
+        return "ok", []
+    exe = shutil.which("clang-format")
+    if exe is None:
+        return "unavailable", ["clang-format not installed; C++ style not enforced"]
+    cmd = [exe, "-style=file", f"-fallback-style={_CF_FALLBACK}"]
+    if assume_filename:
+        cmd.append(f"-assume-filename={assume_filename}")
+    for a, b in ranges:
+        cmd.append(f"--lines={a}:{b}")
+    try:
+        proc = subprocess.run(cmd, input=patched, capture_output=True,
+                              text=True, timeout=20)
+    except Exception as e:
+        return "unavailable", [f"clang-format failed to run: {e}"]
+    if proc.returncode != 0:
+        return "unavailable", [f"clang-format error: {proc.stderr.strip()[:200]}"]
+    if proc.stdout == patched:
+        return "ok", []
+    diff = difflib.unified_diff(patched.splitlines(), proc.stdout.splitlines(),
+                                lineterm="", n=0)
+    firsts = [d for d in diff if d[:1] in "+-" and not d.startswith(("+++", "---"))]
+    return "violations", ["added C++ is not clang-format clean (AOSP style); "
+                          "it would be reformatted to:"] + firsts[:6]
+
+
 def apply_unified_diff(original: str, diff_text: str) -> str | None:
     """Apply a unified diff to `original` in memory (no git, no disk).
     Returns the patched text, or None if a hunk's context doesn't match."""
@@ -510,10 +614,24 @@ def _make_chunk(path: Path, content: str, idx: int) -> dict:
     }
 
 
+_SELINUX_MARKERS = ("/sepolicy/", "/selinux/", "sepolicy", "file_contexts",
+                    "property_contexts", "genfs_contexts", "seapp_contexts",
+                    "service_contexts", "hwservice_contexts", "mac_permissions",
+                    "keys.conf")
+
+
+def is_selinux(path: str) -> bool:
+    """True for SELinux policy artifacts (type-enforcement, contexts, macros)."""
+    p = path.replace("\\", "/").lower()
+    return p.endswith(".te") or p.endswith(".cil") or any(m in p for m in _SELINUX_MARKERS)
+
+
 def guess_layer(path: str) -> str:
     p = path.replace("\\", "/").lower()
     if is_hidl(p):
         return "hidl_legacy"
+    if is_selinux(p):
+        return "selinux"
     if any(x in p for x in ("/vss", "signal", "covesa")):
         return "vss"
     if p.endswith(".aidl") or "/aidl" in p:
