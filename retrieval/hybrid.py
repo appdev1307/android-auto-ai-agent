@@ -312,22 +312,30 @@ class HybridRetriever:
             if ext in {".aidl", ".java", ".kt", ".cpp", ".h", ".yaml", ".yml"}:
                 prior += 0.02
 
-            # Legacy HIDL is already hard-dropped at index time
-            # (should_index -> is_hidl -> False), so in a normal base index there
-            # are no hidl_legacy hits here. This stays as a DEFENSIVE net for a
-            # hidl_legacy chunk that slipped in another way — a pre-existing/older
-            # index, a customer overlay that kept HIDL, or a content-detected
-            # `.bp` — so it can never outrank AIDL for an A14+ question, unless
-            # the query is explicitly about HIDL / migration.
-            if h.get("layer") == "hidl_legacy":
-                if any(x in q for x in ("hidl", "migrat", "legacy", "v2_0", "2.0", ".hal")):
-                    prior += 0.0
-                else:
-                    prior -= self.rank_cfg.get("prior_hidl_penalty", 0.30)
-
             h["score"] = h["score"] + prior
             h["prior"] = prior
-        return hits
+
+        # Stage 2 — HIDL hard drop at retrieval (matches thesis aosp_retriever.py).
+        # Index-time already excludes HIDL; this is the second hard gate for any
+        # hidl_legacy that slipped in (old index, customer overlay, etc.).
+        # Exception: keep hits only when the query is explicitly about HIDL / migration.
+        HIDL_PATH = (
+            "/2.0/", "/1.0/", "/3.0/", "/4.0/", "/hidl/", "/hidl-generated/",
+            "/vehicle/2.0/", "/vehicle/1.0/", "/v2_0/", "/v1_0/", "/v3_0/",
+        )
+        q_is_hidl = any(x in q for x in ("hidl", "migrat", "legacy", "v2_0", "2.0", ".hal"))
+        kept = []
+        for h in hits:
+            pl = (h.get("path") or "").replace("\\", "/").lower()
+            is_hidl_hit = (
+                h.get("layer") == "hidl_legacy"
+                or any(m in pl for m in HIDL_PATH)
+                or pl.endswith(".hal")
+            )
+            if is_hidl_hit and not q_is_hidl:
+                continue  # hard drop
+            kept.append(h)
+        return kept
 
     def _cross_encoder_rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
         pairs = []

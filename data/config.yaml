@@ -76,7 +76,6 @@ rag:
     prior_customer: 0.12      # path matches vendor/device/oem
     prior_customer_store: 0.06  # hit came from the isolated customer store
     prior_symbol_in_path: 0.10
-    prior_hidl_penalty: 0.30  # down-weight legacy HIDL unless query is about HIDL
 
 agent:
   max_tool_iters: 8          # hard cap on ReAct tool loops before finalize

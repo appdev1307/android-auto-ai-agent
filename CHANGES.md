@@ -482,95 +482,38 @@ where framework knowledge belongs.
 
 ---
 
-# Update 22 — Align finalize / few-shot / system with patch_and_ut
+# Update 21 — Patch & unit-test skill (Option 2)
 
-- agent/nodes.py finalize prompt now references skills/patch_and_ut.md and
-  asks for concrete UT ideas (AAOS patterns only) + forced human-review wording.
-- prompts/fewshot_localize.md: added Example 3 (localization + minimal patch
-  description + named UT ideas) for the ignition/resume speed case.
-- prompts/system.md and skills/AGENTS.md aligned with patch_and_ut compliance
-  and customer-first fix location rules.
+Added `skills/patch_and_ut.md` and wired it into the system prompt
+(`agent/nodes.py`).
 
----
+Scope (agreed):
+- Primary compliance: official AOSP Java/Kotlin style + AOSP C++/clang-format
+- C++ / native services / Linux kernel: also MISRA C++ / AUTOSAR C++14
+- Prefer customer/OEM (`vendor/`, `device/`) location for the fix
+- Minimal change only — no large refactors
+- Force `needs_human_review: true` on VHAL / VSS / power / SELinux / AIDL
+- Unit tests use existing AAOS patterns (Car test utils, mock VHAL,
+  power-policy simulation); do not invent new frameworks
 
-# Update 23 — Correctness / hardening pass (6 fixes)
-
-Post-review bugfix batch. Three shipped first (patch-oracle / finalize retriever /
-exact-scope), three follow (incremental scope / index-only paths / read guard).
-
-## 1. Patch oracle no longer false-fails on large files
-`read_file` gained `add_marker`; `finalize` reads the grounding file WITHOUT the
-`... [truncated] ...` marker so it never reaches `apply_unified_diff` / `parse_ok`.
-Files >24k chars used to guarantee a fake syntax error → 2 dead retries → forced
-review. Now: file fits → oracle runs as before; file truncated → diff applied to the
-visible portion, parse-check skipped, honest "verify on a real build" note.
-(`hybrid.py:read_file`, `nodes.py:_grounded_patch_loop`/`finalize`)
-
-## 2. finalize uses the ACTIVE retriever, not an arbitrary cached one
-`finalize` picked `next(iter(_RETRIEVER_CACHE.values()))` — in a multi-tenant process
-that could grab another tenant's retriever and read the wrong customer's tree. Now
-uses `get_retriever()` (the one set in `init_retriever`), matching `specialists`.
-Closes an agent-layer hole in the option-B isolation. (`nodes.py:finalize`)
-
-## 3. Exact/ripgrep channel greps the indexed scope
-`StoreManifest` now records `index_roots` + `scope` at build time; the retriever's
-`_index_roots()` reads them so ripgrep greps exactly what was vectorized instead of
-the legacy flat `index_roots`. Fallback: config scope preset → legacy list.
-(`store.py`, `indexer.py` manifest write, `hybrid.py:_exact_search`)
-
-## 4. Incremental index respects scope
-Incremental only re-applied `should_index` (tier filter), not the scope roots, so a
-change outside scope leaked into the store and full vs incremental diverged. Now
-filters changed files with `_under_roots()` against the manifest's scope roots.
-(`indexer.py`)
-
-## 5. No false "hallucinated path" in index-only mode
-`finalize` flagged EVERY candidate as "possible hallucination" when the source tree
-wasn't mounted (`read_file` can't confirm existence). Now: when `source_present` is
-False, paths aren't flagged (they came from tool results), just a light "not checked
-against a tree" note. (`nodes.py:finalize`)
-
-## 6. read_file path guard closed when aosp_root is "."
-The escape guard was disabled entirely when `aosp_root` defaulted to "." (unset),
-letting an LLM-supplied absolute path (e.g. /etc/passwd) be read. Now an unset root
-confines reads to the working directory and refuses absolute / parent-escaping paths.
-(`hybrid.py:read_file`)
-
-Verified: all touched files compile; truncation + manifest round-trip + scope-root
-resolution checked in isolation. Not run end-to-end (no GPU / AOSP tree / heavy deps
-in the review env).
+This skill runs after localization/diagnosis and turns a grounded root cause
+into a minimal compliant patch draft + concrete unit-test ideas.
 
 ---
 
-# Update 24 — Base-only loads the _base store without a flag (main.py default_tenant)
+# Update 22 — Stage 2 HIDL: hard drop (align with thesis)
 
-Base-only runs (`--customer` omitted) previously returned ZERO hits: `main.py` set
-`tenant=None`, so `_init_store` fell back to the legacy flat `index_dir`
-(`indexes/chroma_aaos`, different collection name) instead of the multi-tenant `_base`
-store built by `--base`. The `default_tenant` in `config.yaml` was never read.
+Stage 2 at retrieval was a soft penalty (`prior_hidl_penalty`). Changed to a
+**hard drop**, matching thesis `rag/aosp_retriever.py` (`_parse_results` + BM25
+corpus filter).
 
-`agent/main.py` now resolves the tenant (`_load_cfg` + `_resolve_tenant`):
-- `--customer <X>` → that tenant (unchanged; a customer overlay is still explicit).
-- `--customer` omitted → fall back to config `default_tenant` (customer `base`) and load
-  `<stores_root>/_base/<ver>` — but ONLY when that store exists on disk; otherwise return
-  `None` and keep the legacy flat index (backward-compat, no crash for pre-multitenant setups).
+`retrieval/hybrid.py` → `_apply_code_priors`:
+- Removed soft penalty on `hidl_legacy`.
+- After priors, any hit whose path matches HIDL markers / `.hal` / `layer==hidl_legacy`
+  is **dropped** unless the query is explicitly about HIDL / migration.
 
-Supersedes the Update 2 note "main.py — explicit, never auto-picked": a **customer** overlay is
-still never auto-picked, but base-only now auto-resolves to `default_tenant` so the index you
-built is actually used — `python -m agent.main --bug "..."` (no `--customer`) works out of the box.
-README (§5 Run, Multi-tenant, Config) updated to match.
+`data/config.yaml`: removed unused `prior_hidl_penalty`.
 
-Verified: tenant-resolution branches (customer given / omit+_base exists / omit+no _base /
-omit+no stores_root) checked in isolation; `main.py` compiles.
-
----
-
-# Update 25 — No fake diffs; AAOS-native UT frameworks
-
-- skills/patch_and_ut.md: hard anti-hallucination (§0); unified diff only if
-  read_source succeeded; SELinux rule; unit tests must name Framework
-  (JUnit4+Robolectric/instrumentation | GoogleTest+gmock | VTS) + TestName +
-  setup/action/assert.
-- prompts/system.md + skills/AGENTS.md + finalize summary_prompt: same rules.
-- fewshot Example 3: UT section uses Framework / Target / setup-action-assert form.
-- Model must not emit fabricated ---/+++/@@ when the file was not read.
+Result: two hard gates only
+1. Index time (`chunker.is_hidl` → `should_index` = False)
+2. Retrieval time (hard drop in `_apply_code_priors`)
