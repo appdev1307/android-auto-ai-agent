@@ -22,5 +22,7 @@ class AgentState(TypedDict):
     status: str
     needs_human_review: bool
     iterations: int
+    relocalize_count: int               # capped re-localization passes after specialist reject
     specialist_notes: list
+    specialist_rounds: int              # ReConcile-style debate rounds actually run
     specialist_consensus: Dict[str, Any]  # majority verdict + force_human_review

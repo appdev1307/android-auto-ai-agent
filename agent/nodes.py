@@ -184,6 +184,91 @@ def seed_retrieval(state: AgentState) -> Dict[str, Any]:
     return {"retrieved": hits, "messages": [HumanMessage(content=seed_text)]}
 
 
+_RELOC_TYPE = re.compile(r"\b[A-Z][A-Za-z0-9]+(?:Service|Manager|Hal|HAL|Policy|Controller|Callback|Property|Provider|Impl|Client)\b")
+_RELOC_PATH = re.compile(r"\b[\w./-]+\.(?:java|kt|cpp|cc|h|aidl|vspec|json)\b")
+
+
+def _relocalize_hints(notes: list, exclude_file: str = "") -> list[str]:
+    """Mine concrete file/symbol names the DISAGREE-ing specialists pointed at
+    (e.g. 'CarPropertyService', 'CarPowerManagementService'). Excludes the
+    already-rejected target so re-seeding doesn't pull the same wrong file back.
+    """
+    excl_stem = ""
+    if exclude_file:
+        excl_stem = exclude_file.split("/")[-1].rsplit(".", 1)[0].lower()
+    hints: list[str] = []
+    for n in notes or []:
+        if (n.get("verdict") or parse_verdict_safe(n)).upper() != "DISAGREE":
+            continue
+        txt = n.get("assessment") or ""
+        hints += _RELOC_TYPE.findall(txt)
+        hints += _RELOC_PATH.findall(txt)
+    seen: set[str] = set()
+    out: list[str] = []
+    for h in hints:
+        hl = h.lower()
+        if not h or hl in seen:
+            continue
+        if excl_stem and (hl == excl_stem or excl_stem in hl):
+            continue
+        seen.add(hl)
+        out.append(h)
+    return out
+
+
+def parse_verdict_safe(note: dict) -> str:
+    from agent.specialists import parse_verdict
+    return note.get("verdict") or parse_verdict(note.get("assessment") or "")
+
+
+def relocalize(state: AgentState) -> Dict[str, Any]:
+    """Specialists strongly rejected the committed file but usually NAME the right
+    artifacts. Mine those hints, run a targeted retrieval, and hand the agent a
+    fresh candidate set so `commit` re-localizes instead of dead-ending at human
+    review. Capped at one pass (see should_relocalize) to avoid loops."""
+    r = get_retriever()
+    dx = state.get("diagnosis") or {}
+    notes = state.get("specialist_notes") or []
+    bug = (state.get("bug_report") or "").strip()
+    count = int(state.get("relocalize_count", 0)) + 1
+    hints = _relocalize_hints(notes, exclude_file=dx.get("file", ""))
+    if r is None or not hints:
+        return {"relocalize_count": count}
+    query = (bug + " " + " ".join(hints[:6])).strip()
+    try:
+        hits = r.retrieve(query) or []
+    except Exception:
+        hits = []
+    if not hits:
+        return {"relocalize_count": count}
+    lines = []
+    for i, h in enumerate(hits[:8], 1):
+        snippet = (h.get("content") or "")[:300].replace("\n", " ")
+        lines.append(f"{i}. [{h.get('layer')}|score={h.get('score', 0):.3f}] "
+                     f"{h.get('path')}\n   {snippet}")
+    msg = ("Re-localization — the specialists rejected the previous target "
+           f"({dx.get('file')}) as the wrong file. Strongest layer hints they "
+           f"named: {', '.join(hints[:6])}. Fresh top hybrid-RAG hits below — pick "
+           "the correct target from THESE exact paths and re-commit:\n"
+           + "\n".join(lines))
+    return {"retrieved": hits, "relocalize_count": count,
+            "needs_human_review": False,
+            "messages": [HumanMessage(content=msg)]}
+
+
+def should_relocalize(state: AgentState) -> Literal["relocalize", "finalize"]:
+    # One re-localization pass only.
+    if int(state.get("relocalize_count", 0)) >= 1:
+        return "finalize"
+    c = state.get("specialist_consensus") or {}
+    if not c.get("reject_committed"):
+        return "finalize"
+    dx = state.get("diagnosis") or {}
+    if _relocalize_hints(state.get("specialist_notes") or [], exclude_file=dx.get("file", "")):
+        return "relocalize"
+    return "finalize"
+
+
 def agent_reason(state: AgentState) -> Dict[str, Any]:
     """LLM with tools — localize / explain using hybrid RAG tools."""
     # Pass the running conversation intact (task framing was seeded once in
@@ -362,7 +447,7 @@ def _strip_model_diffs(text: str, protect_from: str | None = None) -> tuple[str,
         if i < n and lines[i].strip().startswith("```"):
             i += 1
         out.append("_(draft diff removed — not grounded against the real file this "
-                   "run; see root cause and unit-test ideas above)_")
+                   "run; see root cause and unit test above)_")
         stripped = True
 
     if not stripped:
@@ -593,12 +678,20 @@ is generated separately and grounded against the real file).
 
 Produce ONLY this section:
 
-## Unit test ideas
-AAOS-native frameworks only (Java/HMI/CarService: JUnit4 + Robolectric or
-instrumentation; VHAL/native: GoogleTest + gmock; HAL: VTS when applicable).
-The test MUST exercise the committed symbols / property_ids below and reference
-ONLY names that appear in them or in the target file — do not invent API.
-For each test: Framework + TestName + setup/action/assert.
+## Unit test
+Write a COMPLETE, COMPILABLE test file — real code, NOT bullet-point ideas or a
+sketch. It must fail before the fix and pass after it. Use the AAOS-native
+framework for the layer:
+  - Java (CarService/HMI): JUnit4 + Robolectric or AndroidJUnit4 — full class with
+    package, imports, @RunWith, @Test methods and Mockito mocks.
+  - C++ (VHAL/native): GoogleTest + gmock — full TEST_F with fixture and #includes.
+  - HAL: VTS-style test when applicable.
+Format: first a single line `Target test path: <dir>/<TestClass>.<ext>`, then the
+FULL test inside one fenced code block (```java or ```cpp).
+Bind the test to the COMMITTED symbols / property_ids below and reference ONLY
+names that appear in them or in the target file excerpt — do NOT invent API,
+class names, or methods. If a needed symbol is missing from the evidence, use the
+closest committed symbol instead of inventing one.
 """
 
 ALWAYS_REVIEW_LAYERS = {"native", "vhal", "vss", "aidl", "hidl_legacy", "selinux", "binder", "startup_power", "frameworks"}
@@ -647,19 +740,29 @@ def finalize(state: AgentState) -> Dict[str, Any]:
     )
     text += spec_notes
 
-    # 2) Unit test — LLM writes it, bound to the committed facts only.
+    # 2) Unit test — LLM writes REAL compilable test code, bound to committed facts
+    #    and the target file's actual API (fed below so it doesn't invent methods).
+    ut_file = dx.get("file") or ""
+    ut_excerpt = ""
+    if r is not None and ut_file:
+        try:
+            ut_excerpt = r.read_file(ut_file, max_chars=4000)
+        except Exception:
+            ut_excerpt = ""
     facts = (f"Committed diagnosis:\n- file: {dx.get('file')}\n"
              f"- layer: {dx.get('layer')}\n"
              f"- symbols: {', '.join(dx.get('symbols') or []) or '(none)'}\n"
              f"- property_ids: {', '.join(dx.get('property_ids') or []) or '(none)'}\n"
-             f"- root_cause: {dx.get('root_cause')}")
+             f"- root_cause: {dx.get('root_cause')}\n\n"
+             f"Target file excerpt (reference REAL API from here — do not invent):\n"
+             f"{ut_excerpt or '(not available)'}")
     try:
         resp = llm.invoke([SystemMessage(content=SYSTEM + spec_notes),
                            HumanMessage(content=facts),
                            HumanMessage(content=_UT_PROMPT)])
         ut_text = resp.content if isinstance(resp.content, str) else str(resp.content)
     except Exception:
-        ut_text = "## Unit test ideas\n_(unit test generation unavailable)_"
+        ut_text = "## Unit test\n_(unit test generation unavailable)_"
     text += "\n\n" + ut_text
 
     # 3) Safety-critical layers ALWAYS require a human — from the committed layers.

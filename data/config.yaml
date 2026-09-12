@@ -85,6 +85,7 @@ rag:
 agent:
   max_tool_iters: 8          # hard cap on ReAct tool loops before finalize
   max_specialists: 5         # vertical specialist fan-out cap (+ consensus)
+  max_debate_rounds: 3       # ReConcile-style round-table; stops early on convergence
   patch_max_tries: 2         # generate->parse-check->regenerate retries for the patch
 
 stack:
