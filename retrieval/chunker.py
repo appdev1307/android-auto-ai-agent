@@ -627,23 +627,30 @@ def is_selinux(path: str) -> bool:
 
 
 def guess_layer(path: str) -> str:
-    p = path.replace("\\", "/").lower()
+    p = path.replace('\\', "/").lower()
     if is_hidl(p):
         return "hidl_legacy"
     if is_selinux(p):
         return "selinux"
-    if any(x in p for x in ("/vss", "signal", "covesa")):
+    if any(x in p for x in ("/vss", "signal", "covesa", ".vspec")):
         return "vss"
     if p.endswith(".aidl") or "/aidl" in p:
         return "aidl"
+    if any(x in p for x in ("libbinder", "/binder/", "bnvehicle", "bpvehicle")):
+        return "binder"
     if "hardware/interfaces/automotive" in p or "vehiclehal" in p or "/vhal" in p:
         return "vhal"
+    if any(x in p for x in ("powerpolicy", "power_policy", "early_init")):
+        return "startup_power"
     if "packages/services/car" in p:
         return "carservice"
     if any(x in p for x in ("packages/apps", "carui", "hmi", "systemui")):
         return "hmi"
+    if any(x in p for x in ("frameworks/base", "frameworks/av")):
+        return "frameworks"
     if p.endswith((".cpp", ".cc", ".c", ".h", ".hpp")):
         return "native"
     if "vendor/" in p or "device/" in p:
         return "customer"
     return "other"
+

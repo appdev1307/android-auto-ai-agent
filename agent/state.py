@@ -22,3 +22,4 @@ class AgentState(TypedDict):
     needs_human_review: bool
     iterations: int
     specialist_notes: list
+    specialist_consensus: Dict[str, Any]  # majority verdict + force_human_review

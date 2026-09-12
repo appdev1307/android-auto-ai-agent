@@ -595,3 +595,55 @@ Result: two hard gates only
 
 Note: Update 2 above still documents the original soft-penalty design; this update
 supersedes that Stage-2 behavior.
+
+# Update 27 — Vertical specialists + horizontal skill packs + agent contract
+
+## Vertical specialists (graph nodes, capped at 3)
+Extended set: vhal | aidl | binder | carservice | hmi | vss | startup_power |
+frameworks (+ native, selinux when tagged).
+
+New prompts: `prompts/specialists/{binder,startup_power,frameworks}.md`
+
+## Router (`agent/specialists.py`)
+`route_specialist_layers(diagnosis, bug, evidence_paths)`:
+1. committed layer + candidate layers
+2. path-prefix hints
+3. bug keywords
+→ unique list, max 3
+
+## Horizontal skill packs (no extra LLM call)
+Auto-loaded from `skills/*.md` (sorted). Injected into specialist system prompts
+when layer/keywords/paths match:
+- `30-aaos_app.md` — Car UI / CarPropertyManager / HMI lifecycle
+- `40-sdv_vss.md` — COVESA VSS / signal mapping
+- `50-native_hal.md` — native HAL / C++ services
+
+## Contract (consistency among agents)
+`skills/CONTRACT.md` — single source of truth rules: validate don't re-diagnose,
+evidence grounding, layer boundaries, output discipline, safety.
+Prepended to every specialist system prompt; also in global SYSTEM via auto-load.
+
+## Wiring
+- `nodes.py`: `load_skills()` auto-discovers `skills/*.md` (CONTRACT first);
+  removed hardcoded per-file skill includes.
+- `config.yaml`: `prompt.skills_dir`, `prompt.skill_files`; stack.layers extended.
+- `chunker.guess_layer`: binder, startup_power, frameworks tags.
+- `ALWAYS_REVIEW_LAYERS` / `SENSITIVE` include new layers.
+
+Drop a new `skills/60-foo.md` to extend horizontal knowledge without code changes.
+
+## Update 27b — MAX_SPECIALISTS=5 + consensus protocol
+
+- Cap raised from 3 → **5** (`agent.max_specialists` in config, overridable).
+- **Priority keyword pass**: ignition/resume/power → `startup_power`; binder death →
+  `binder`; avc/selinux → `selinux` forced into the pool before path candidates fill slots.
+- **Structured verdict**: specialists must start with `VERDICT: AGREE|DISAGREE|PARTIAL`.
+- **Deterministic consensus** (`build_consensus`, no extra LLM):
+  - majority AGREE → agree
+  - DISAGREE on committed layer or DISAGREE ≥ AGREE → conflict → `force_human_review`
+  - AGREE with minority DISAGREE → agree_with_dissent → human review
+  - only PARTIAL → weak
+- `specialist_consensus` stored on agent state; finalize surfaces summary and honours
+  force_human_review.
+- CONTRACT §7 documents consensus rules for all roles.
+

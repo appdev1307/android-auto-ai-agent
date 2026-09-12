@@ -79,12 +79,13 @@ rag:
 
 agent:
   max_tool_iters: 8          # hard cap on ReAct tool loops before finalize
+  max_specialists: 5         # vertical specialist fan-out cap (+ consensus)
   patch_max_tries: 2         # generate->parse-check->regenerate retries for the patch
 
 stack:
   target_android: 15
   full_stack: true
-  layers: ["hmi", "carservice", "aidl", "vhal", "vss", "native"]
+  layers: ["hmi", "carservice", "aidl", "binder", "vhal", "vss", "startup_power", "frameworks", "native"]
 
 retrieval:
   max_file_chars: 14000
@@ -101,3 +102,5 @@ logging:
 prompt:
   hints_dir: "hints"        # folder scanned for custom *.md hints
   hint_files: []            # extra explicit hint files (optional)
+  skills_dir: "skills"      # auto-load all *.md (CONTRACT first, then sorted)
+  skill_files: []           # extra explicit skill files (optional)

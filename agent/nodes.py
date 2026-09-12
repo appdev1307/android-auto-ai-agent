@@ -55,6 +55,35 @@ def load_hints() -> str:
     return "\n\n# Operator hints (custom)\n" + "\n\n".join(parts)
 
 
+def load_skills() -> str:
+    """Auto-load horizontal + global skill packs from skills/*.md.
+
+    Sorted by filename (use 00-, 10-, … prefixes). CONTRACT.md is loaded first
+    if present so every role shares the same rules. Explicit extras via
+    `prompt.skill_files`. Restart to pick up changes. No code edit to add a pack.
+    """
+    root = Path(__file__).resolve().parents[1]
+    prompt_cfg = CFG.get("prompt", {}) or {}
+    skills_dir = root / prompt_cfg.get("skills_dir", "skills")
+    parts: list[str] = []
+    # Contract first (consistent rules among agents)
+    for contract_name in ("CONTRACT.md", "00-CONTRACT.md"):
+        cp = skills_dir / contract_name
+        if cp.exists():
+            parts.append(cp.read_text(encoding="utf-8"))
+            break
+    if skills_dir.is_dir():
+        for f in sorted(skills_dir.glob("*.md")):
+            if f.name.upper() in ("CONTRACT.MD", "00-CONTRACT.MD"):
+                continue  # already first
+            parts.append(f.read_text(encoding="utf-8"))
+    for rel in prompt_cfg.get("skill_files", []) or []:
+        parts.append(load_text(rel))
+    if not parts:
+        return ""
+    return "\n\n" + "\n\n".join(parts)
+
+
 CFG = load_config()
 MODEL = CFG.get("model", {})
 API_BASE = MODEL.get("api_base") or os.environ.get("OPENAI_API_BASE")
@@ -78,11 +107,10 @@ if API_BASE:
 llm = ChatOpenAI(**_kwargs)
 llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
+# system + fewshot + auto skills (CONTRACT + packs) + operator hints
 SYSTEM = load_text("prompts/system.md") + "\n\n" + load_text("prompts/fewshot_localize.md")
-SYSTEM += "\n\n" + load_text("skills/AGENTS.md")
-SYSTEM += "\n\n" + load_text("skills/android_automotive.md")
-SYSTEM += "\n\n" + load_text("skills/patch_and_ut.md")
-SYSTEM += load_hints()   # custom hints from hints/*.md + config prompt.hint_files
+SYSTEM += load_skills()
+SYSTEM += load_hints()
 
 
 # Build the retriever once per root and reuse it. Rebuilding on every graph
@@ -187,7 +215,7 @@ def commit_diagnosis(state: AgentState) -> Dict[str, Any]:
 
 
 
-SENSITIVE = ("vhal", "vss", "selinux", "power", "aidl", "hardware/interfaces")
+SENSITIVE = ("vhal", "vss", "selinux", "power", "aidl", "hardware/interfaces", "binder", "startup", "ignition", "resume", "frameworks")
 
 
 _PATH_RE = re.compile(r"(?:^|\s)((?:[\w.\-]+/){1,}[\w.\-]+\.\w+)")
@@ -515,7 +543,7 @@ ONLY names that appear in them or in the target file — do not invent API.
 For each test: Framework + TestName + setup/action/assert.
 """
 
-ALWAYS_REVIEW_LAYERS = {"native", "vhal", "vss", "aidl", "hidl_legacy", "selinux"}
+ALWAYS_REVIEW_LAYERS = {"native", "vhal", "vss", "aidl", "hidl_legacy", "selinux", "binder", "startup_power", "frameworks"}
 
 
 def finalize(state: AgentState) -> Dict[str, Any]:
@@ -529,10 +557,15 @@ def finalize(state: AgentState) -> Dict[str, Any]:
     dx = state.get("diagnosis") or {}
     r = get_retriever()
     needs_review = bool(state.get("needs_human_review"))
+    consensus = state.get("specialist_consensus") or {}
+    if consensus.get("force_human_review"):
+        needs_review = True
 
     # 1) The committed diagnosis IS the candidate list + root cause (source of truth).
     text = render_diagnosis(dx)
-    spec_notes = format_specialist_notes(state.get("specialist_notes") or [])
+    spec_notes = format_specialist_notes(
+        state.get("specialist_notes") or [], consensus=consensus
+    )
     text += spec_notes
 
     # 2) Unit test — LLM writes it, bound to the committed facts only.
