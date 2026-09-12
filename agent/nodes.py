@@ -142,6 +142,48 @@ def init_retriever(state: AgentState) -> Dict[str, Any]:
 MAX_TOOL_ITERS = int(CFG.get("agent", {}).get("max_tool_iters", 8))
 
 
+def seed_retrieval(state: AgentState) -> Dict[str, Any]:
+    """Deterministic first pass: run the hybrid retriever ONCE on the bug text
+    before the ReAct loop, so localization never depends on the LLM choosing to
+    call a search tool.
+
+    Two outputs:
+      - state['retrieved']: the structured ranked hits, used by commit as grounding
+        substance and by finalize as the authoritative candidate list (fallback).
+      - a HumanMessage listing the top real paths, so the agent grounds on indexed
+        files instead of inventing a plausible-looking path.
+
+    This also guarantees the full ranking stack (dense + BM25 + exact + reranker)
+    actually runs every session.
+    """
+    r = get_retriever()
+    bug = (state.get("bug_report") or "").strip()
+    log = (state.get("logcat_snippet") or "").strip()
+    query = (bug + "\n" + log).strip()
+    hits: list = []
+    if r is not None and query:
+        try:
+            hits = r.retrieve(query) or []
+        except Exception:
+            hits = []
+    if not hits:
+        return {"retrieved": []}
+
+    lines = []
+    for i, h in enumerate(hits[:8], 1):
+        snippet = (h.get("content") or "")[:400].replace("\n", " ")
+        lines.append(
+            f"{i}. [{h.get('layer')}|{h.get('source')}|score={h.get('score', 0):.3f}] "
+            f"{h.get('path')}\n   {snippet}"
+        )
+    seed_text = (
+        "Seed retrieval — top hybrid-RAG hits for this bug. Use these EXACT paths "
+        "as your candidates and target file; do not invent paths that are not "
+        "listed here or returned by a tool:\n" + "\n".join(lines)
+    )
+    return {"retrieved": hits, "messages": [HumanMessage(content=seed_text)]}
+
+
 def agent_reason(state: AgentState) -> Dict[str, Any]:
     """LLM with tools — localize / explain using hybrid RAG tools."""
     # Pass the running conversation intact (task framing was seeded once in
@@ -196,6 +238,22 @@ def commit_diagnosis(state: AgentState) -> Dict[str, Any]:
     re-deriving from prose."""
     msgs = list(state.get("messages", []))
     evidence = collect_evidence(msgs)
+    # Fold in the deterministic seed retrieval so grounding has real indexed
+    # files to check against even when the LLM never called a search tool. The
+    # seed paths + snippets become part of the evidence corpus, so a committed
+    # file / symbol that matches an indexed hit now grounds instead of being
+    # dropped wholesale.
+    seeded = state.get("retrieved") or []
+    if seeded:
+        extra = "\n".join(
+            f"{h.get('path', '')}\n{(h.get('content') or '')[:500]}"
+            for h in seeded if h.get("path")
+        )
+        spaths = [h.get("path") for h in seeded if h.get("path")]
+        evidence = {
+            "corpus": (evidence["corpus"] + "\n" + extra).strip(),
+            "paths": list(dict.fromkeys(list(evidence["paths"]) + spaths)),
+        }
     resp = llm.invoke([SystemMessage(content=SYSTEM)] + msgs
                       + [HumanMessage(content=_COMMIT_PROMPT)])
     raw = resp.content if isinstance(resp.content, str) else str(resp.content)
@@ -562,7 +620,28 @@ def finalize(state: AgentState) -> Dict[str, Any]:
         needs_review = True
 
     # 1) The committed diagnosis IS the candidate list + root cause (source of truth).
+    #    Fallback: if the LLM grounded no candidate, show the retriever's own
+    #    ranked hits so localization always yields real, indexed files instead of
+    #    collapsing to "(none grounded)". The patch stays gated on `committed`, so
+    #    this is localization-only — it never fabricates a patch.
+    fallback_candidates = False
+    if not dx.get("candidates"):
+        fb = []
+        for h in (state.get("retrieved") or [])[:8]:
+            p = h.get("path")
+            if not p:
+                continue
+            fb.append({"path": p, "layer": h.get("layer") or guess_layer(p),
+                       "why": f"retriever-ranked (score={h.get('score', 0):.3f})"})
+        if fb:
+            dx = {**dx, "candidates": fb}
+            fallback_candidates = True
+
     text = render_diagnosis(dx)
+    if fallback_candidates:
+        text += ("\n\n> \u2139 Candidates above are the retriever's top hybrid-RAG "
+                 "hits (the LLM committed no grounded file). Localization only — "
+                 "verify before use.")
     spec_notes = format_specialist_notes(
         state.get("specialist_notes") or [], consensus=consensus
     )

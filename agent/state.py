@@ -13,6 +13,7 @@ class AgentState(TypedDict):
     tenant: Optional[Dict[str, str]]
     task_type: str
     evidence: List[Dict[str, Any]]      # retrieval hits actually gathered this run
+    retrieved: List[Dict[str, Any]]     # deterministic seed-retrieval hits (localization floor)
     diagnosis: Diagnosis                # committed single source of truth
     candidate_files: List[str]
     root_cause: Optional[str]

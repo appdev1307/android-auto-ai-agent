@@ -1,12 +1,13 @@
 from langgraph.graph import StateGraph, START, END
 from agent.state import AgentState
-from agent.nodes import (init_retriever, agent_reason, should_continue,
+from agent.nodes import (init_retriever, seed_retrieval, agent_reason, should_continue,
                          tool_node, commit_diagnosis, finalize, specialists)
 
 
 def build_graph():
     g = StateGraph(AgentState)
     g.add_node("init_retriever", init_retriever)
+    g.add_node("seed_retrieval", seed_retrieval)  # deterministic first retrieval (localization floor)
     g.add_node("agent", agent_reason)
     g.add_node("tools", tool_node)
     g.add_node("commit", commit_diagnosis)   # free-text -> committed, validated facts
@@ -14,7 +15,8 @@ def build_graph():
     g.add_node("finalize", finalize)
 
     g.add_edge(START, "init_retriever")
-    g.add_edge("init_retriever", "agent")
+    g.add_edge("init_retriever", "seed_retrieval")
+    g.add_edge("seed_retrieval", "agent")
     g.add_conditional_edges("agent", should_continue,
                             {"tools": "tools", "commit": "commit"})
     g.add_edge("tools", "agent")             # ReAct loop
