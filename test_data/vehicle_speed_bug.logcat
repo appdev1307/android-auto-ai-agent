@@ -1,0 +1,12 @@
+--------- beginning of system
+01-05 09:14:22.301  1123  1187 I CarPowerManagementService: setCurrentState state=ON(6) from SUSPEND
+01-05 09:14:22.455  1123  1187 D CarPropertyService: registerCallback prop=0x11600207 (PERF_VEHICLE_SPEED) rate=10.0 client=com.android.car.cluster.ClusterHomeService
+01-05 09:14:22.902  1123  1450 I CarPropertyService: onSuspend: cleared 3 client subscriptions before power off
+01-05 09:14:31.777  2044  2044 W CarPropertyManager: getProperty PERF_VEHICLE_SPEED (0x11600207) returned stale value; no onChangeEvent delivered since power ON
+01-05 09:14:31.780  2044  2044 D ClusterHomeService: speed gauge not updating, last=0.0 km/h
+01-05 09:14:31.812  1123  1187 W CarPropertyEventCallbackController: no callback registered for 0x11600207 after resume
+01-05 09:14:31.998  1123  1187 E CarPropertyService: Failed to re-subscribe PERF_VEHICLE_SPEED after power state ON
+	at com.android.car.CarPropertyService.onStateChanged(CarPropertyService.java:412)
+	at com.android.car.CarPowerManagementService.notifyPowerOn(CarPowerManagementService.java:889)
+	at com.android.car.hal.PropertyHalService.onPropertySetError(PropertyHalService.java:233)
+01-05 09:14:32.140  2044  2044 I ClusterHomeService: VSS Vehicle.Speed subscription inactive; UI shows last cached value
