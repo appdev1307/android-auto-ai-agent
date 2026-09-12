@@ -71,7 +71,12 @@ rag:
     rrf_k: 60                 # RRF constant
     rrf_pool: 30              # candidates into cross-encoder
     cross_encoder_enabled: true
-    cross_encoder_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    # Code-capable reranker. ms-marco-MiniLM is a tiny web-QA model that reranks
+    # identifier-heavy source poorly; bge-reranker handles code far better.
+    # Loader falls back bge-reranker-base -> ms-marco -> embedding rerank (dense
+    # embedder) if a model can't be downloaded here. Heavier/stronger alt:
+    # "BAAI/bge-reranker-v2-m3".
+    cross_encoder_model: "BAAI/bge-reranker-base"
     ce_blend: 0.75            # weight of CE vs RRF+prior score
     prior_customer: 0.12      # path matches vendor/device/oem
     prior_customer_store: 0.06  # hit came from the isolated customer store

@@ -56,6 +56,16 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[A-Za-z_][A-Za-z0-9_\.]+|[A-Za-z]{2,}", text.lower())
 
 
+# High-signal AAOS identifiers, extracted verbatim from the bug/query so the
+# exact/ripgrep channel greps for the RIGHT thing instead of generic words.
+# These are the tokens that actually pin a bug to a file on the AAOS stack.
+_ID_CONST = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")            # PERF_VEHICLE_SPEED, PROP_* (needs an underscore)
+_ID_IFACE = re.compile(r"\bI[A-Z][A-Za-z0-9]{2,}\b")                    # IVehicle, ICarProperty
+_ID_TYPE  = re.compile(r"\b[A-Z][A-Za-z0-9]*(?:Service|Manager|Hal|HAL|Callback|Client|Property|Controller|Provider|Impl)\b")
+_ID_FQN   = re.compile(r"\b(?:android|com|org)(?:\.[A-Za-z_]\w*){2,}\b")  # android.car.hardware.* dotted paths
+_ID_STACK = re.compile(r"\bat\s+([A-Za-z_][\w.$]+)\(")                    # logcat frame: "at pkg.Class.method("
+
+
 class HybridRetriever:
     def __init__(self, aosp_root: str | None = None, config_path: str = "data/config.yaml",
                  tenant: "Tenant | None" = None, store: "VectorStore | None" = None):
@@ -72,6 +82,7 @@ class HybridRetriever:
         self.embedder = None
         self.store: VectorStore | None = store
         self.cross_encoder: CrossEncoder | None = None
+        self.cross_encoder_name: str | None = None
 
         # Dev workflow indexes once (index persists) and may discard the source
         # tree. Dense + BM25 read content from the index and keep working; the
@@ -112,13 +123,30 @@ class HybridRetriever:
     def _init_cross_encoder(self):
         if not self.rank_cfg.get("cross_encoder_enabled", True):
             return
-        model_name = self.rank_cfg.get(
-            "cross_encoder_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
-        )
-        try:
-            self.cross_encoder = CrossEncoder(model_name)
-        except Exception:
-            self.cross_encoder = None
+        # Preference order: whatever config names, then a general reranker that
+        # handles code/identifier-heavy text far better than the tiny web-QA
+        # ms-marco model, then ms-marco as a last resort. Load the FIRST that
+        # actually initializes, so a model that can't be downloaded in this
+        # environment degrades to the next instead of leaving no reranker.
+        # If none load, retrieve() falls back to embedding-based rerank using
+        # the (code-aware) dense embedder — see _embed_rerank.
+        prefs = [
+            self.rank_cfg.get("cross_encoder_model"),
+            "BAAI/bge-reranker-base",
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        ]
+        seen: set[str] = set()
+        for name in prefs:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            try:
+                self.cross_encoder = CrossEncoder(name)
+                self.cross_encoder_name = name
+                return
+            except Exception:
+                continue
+        self.cross_encoder = None
 
     # ------------------------------------------------------------------ public
     def retrieve(self, query: str, top_k: int | None = None) -> list[dict[str, Any]]:
@@ -145,6 +173,10 @@ class HybridRetriever:
 
         if self.cross_encoder and fused:
             fused = self._cross_encoder_rerank(query, fused, top_k=top_k)
+        elif fused and self.embedder:
+            # No cross-encoder available — rerank with the code-aware dense
+            # embedder instead of just truncating the RRF pool.
+            fused = self._embed_rerank(query, fused, top_k=top_k)
         else:
             fused = fused[:top_k]
         return fused
@@ -364,6 +396,38 @@ class HybridRetriever:
         hits.sort(key=lambda x: x["score"], reverse=True)
         return hits[:top_k]
 
+    def _embed_rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
+        """Fallback rerank when no cross-encoder loaded: score each candidate by
+        cosine(query, content) with the SAME code-aware embedder that powers the
+        dense channel. It re-scores the whole fused pool — including BM25/exact
+        hits the dense channel never ranked — so it still adds signal over raw
+        RRF, and it's code-aware by construction (no web-QA reranker involved).
+        Blends with the RRF+prior score using the same `ce_blend`.
+        """
+        if not self.embedder:
+            return hits[:top_k]
+        try:
+            texts = [(h.get("content") or h.get("path") or "")[:1500] for h in hits]
+            qv = self.embedder.encode([query]).tolist()[0]
+            dvs = self.embedder.encode(texts).tolist()
+        except Exception:
+            return hits[:top_k]
+
+        def _cos(a: list[float], b: list[float]) -> float:
+            s = sum(x * y for x, y in zip(a, b))
+            na = math.sqrt(sum(x * x for x in a)) or 1.0
+            nb = math.sqrt(sum(y * y for y in b)) or 1.0
+            return s / (na * nb)
+
+        alpha = self.rank_cfg.get("ce_blend", 0.75)
+        for h, d in zip(hits, dvs):
+            sim = _cos(qv, d)                                  # cosine in [-1, 1]
+            h["ce_score"] = sim
+            h["ce_norm"] = max(0.0, min(1.0, (sim + 1.0) / 2.0))  # -> [0, 1]
+            h["score"] = alpha * h["ce_norm"] + (1 - alpha) * h["score"]
+        hits.sort(key=lambda x: x["score"], reverse=True)
+        return hits[:top_k]
+
     # ------------------------------------------------------------------ utils
     def read_file(self, path: str, max_chars: int | None = None, add_marker: bool = True) -> str:
         max_chars = max_chars or self.cfg.get("retrieval", {}).get("max_file_chars", 14000)
@@ -407,12 +471,35 @@ class HybridRetriever:
         return (filt or hits)[:8]
 
     def _keywords(self, query: str) -> list[str]:
+        """Keywords for the exact/ripgrep channel, STRONGEST first (only the top
+        8 become the rg pattern). AAOS bugs carry identifiers that pin the file —
+        property/constant ids, AIDL interfaces, *Service/*Manager types, dotted
+        FQNs, and the class from a logcat stack frame — so those lead, ahead of
+        the old generic domain words.
+        """
+        strong: list[str] = []
+        for rx in (_ID_CONST, _ID_IFACE, _ID_TYPE, _ID_FQN):
+            strong += rx.findall(query)
+        for m in _ID_STACK.finditer(query):          # "at a.b.C.method(" -> keep the class a.b.C
+            frame = m.group(1)
+            strong.append(frame.rsplit(".", 1)[0] if "." in frame else frame)
+
         stop = {"the", "a", "an", "after", "on", "in", "of", "and", "or", "to", "for", "with", "not", "is"}
         words = re.findall(r"[A-Za-z_][A-Za-z0-9_\.]{2,}", query)
         boost = [w for w in words if any(x in w.lower() for x in
                  ("hal", "vhal", "vss", "aidl", "car", "vehicle", "property", "signal", "speed", "hmi"))]
         base = [w for w in words if w.lower() not in stop]
-        return boost or base[:10]
+
+        # strong ids first, then domain boosts, then a few generic words as a
+        # fallback (fewer of those when we already have strong signal).
+        ordered = strong + boost + (base[:10] if not (strong or boost) else base[:4])
+        seen: set[str] = set()
+        out: list[str] = []
+        for w in ordered:
+            if w and w not in seen:
+                seen.add(w)
+                out.append(w)
+        return out
 
 
 # ── Backward-compat: wrap the old flat index_dir as a single 'base' store ──
