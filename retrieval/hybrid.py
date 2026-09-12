@@ -255,10 +255,17 @@ class HybridRetriever:
                         "layer": h.get("layer", "other"),
                         "score": 0.0,
                         "source": name,
+                        "store": h.get("store"),
                         "rrf_parts": {},
                     }
                 by_path[p]["score"] += rrf
                 by_path[p]["rrf_parts"][name] = rrf
+                # Carry the store tag through fusion so the customer-first prior
+                # can still fire downstream. A path lives in exactly one store,
+                # but it can arrive from several channels (dense+bm25); once any
+                # channel tags it 'customer', keep that — it must not be lost.
+                if h.get("store") == "customer":
+                    by_path[p]["store"] = "customer"
                 # keep longer snippet
                 if len(h.get("content") or "") > len(by_path[p].get("content") or ""):
                     by_path[p]["content"] = h["content"]
