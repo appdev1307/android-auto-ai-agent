@@ -1,78 +1,123 @@
-# Android 15 AAOS / SDV full stack
+# Android Automotive OS (AAOS) full-stack diagnostic skill
 
-## Layers
-1. **HMI** — Car UI Library, OEM apps (Android Studio), multi-display
-2. **CarService** — packages/services/Car, CarPropertyService, power policy
-3. **AIDL** — stable interfaces vendor ↔ system
-4. **VHAL** — hardware/interfaces/automotive/vehicle, C/C++
-5. **VSS** — COVESA signals, OEM YAML catalogs, signal↔property mapping (often under vendor/)
+Grounded in AOSP automotive documentation (source.android.com): VHAL AIDL,
+property configuration, power policy, CarPropertyManager path, and SELinux
+client rules. Target: Android 14+ / 15 (AIDL VHAL). HIDL VHAL is legacy and
+must not be used as the fix pattern unless the bug is explicitly a migration.
 
-## Customer component first
-OEM bugs often live in `vendor/` and `device/` (mapping, RRO, custom HAL, HMI). Search there before blaming AOSP.
+## 1. Stack data path (localize the first broken hop)
 
-## Android 15
-- Stricter foreground service types
-- Window insets / edge-to-edge
-- Background work limits may affect property listeners if mis-implemented in app layer
+```
+App / HMI
+  → CarPropertyManager (Java API)
+  → CarPropertyService / CarService
+  → AIDL IVehicle (android.hardware.automotive.vehicle)
+  → VHAL implementation (DefaultVehicleHal + IVehicleHardware)
+  → vehicle bus / OEM mapping (often VSS ↔ property under vendor/)
+```
 
----
+Rules:
+- Apps must use Car APIs (`CarPropertyManager`), not talk to VHAL directly.
+  SELinux blocks direct app→VHAL access (AOSP native-client guidance).
+- Native daemons use `libvhalclient` (`IVhalClient`) from Android 13+, not ad-hoc binder.
+- OEM behavior often diverges in `vendor/` and `device/` — search those before blaming AOSP.
 
-# Diagnostic playbook (how to localize, not just what to output)
+## 2. Logcat / symptom → starting layer
 
-## Step 1 — read the symptom, map to a starting layer
-Use the logcat signature to pick where to search first:
-- `FATAL EXCEPTION` / `NullPointerException` in a Car app or Fragment → **HMI** (vendor app)
-- `CarService`, `CarPropertyService`, `CarPropertyManager` in the trace → **CarService**
-- `binder` / `TransactionFailedException` / `IVehicle` → **AIDL** boundary
-- `VehicleHal`, `getValues`/`setValues` timeout, `StatusCode` → **VHAL**
-- signal name unknown, mapping/catalog, `Vehicle.*` not found → **VSS mapping** (usually vendor/)
-- `SELinux avc: denied` / `neverallow` → **sepolicy** (SELinux), not the app
-- `SecurityException permission` → manifest / permission, not the HAL
+| Signature | Start layer | What to verify first |
+|-----------|-------------|----------------------|
+| `FATAL EXCEPTION` / NPE in Car app, Fragment, Compose | HMI | null property value, wrong areaId, callback thread |
+| `CarPropertyService` / `CarPropertyManager` | CarService | subscription table, permission, property config cache |
+| `TransactionTooLarge` / `DeadObjectException` / `IVehicle` | AIDL / binder | parcel size, binder death, service restart |
+| `VehicleHal` / `getValues` / `setValues` / `StatusCode` | VHAL | prop config, StatusCode, hardware backend |
+| `Vehicle.*` unknown / mapping / catalog | VSS / vendor mapping | signal path string, type/unit, missing map entry |
+| `avc: denied` / `neverallow` | SELinux | domain, allow rule, vendor sepolicy only |
+| `PERMISSION_` / `SecurityException` (Car) | permission | Car permission / vendor extension permission |
+| Stops updating after ignition / suspend / resume | startup_power + client | power policy listener + re-subscribe |
 
-## Step 2 — trace the data path, don't jump around
-For "signal/value not reaching the UI", trace the flow end-to-end and check each hop:
-`HMI reads property → CarPropertyManager → CarPropertyService → AIDL IVehicle → VHAL impl → VSS→property mapping`.
-Localize the FIRST hop where the value is wrong or missing. For "action from UI has no effect",
-trace the same chain in reverse (set path).
+## 3. VHAL property model (AOSP)
 
-## Step 3 — match symptom to common suspects
-- **Not updating after ignition/resume/power state** → subscription/callback not re-registered on
-  resume; power-policy listener; CarService lifecycle. Look at register/subscribe + power handlers.
+Property identity is not a free integer. System properties are defined in
+`VehicleProperty.aidl` / property AIDL (Android 14+ split). Config fields that
+must match the published spec:
 
-  Common on A15 when mapping is correct and VHAL is still publishing:
-  1. Client did not re-register `CarPropertyManager.registerCallback` / `registerListener`
-     after the Car connection or process was torn down by power policy.
-  2. CarService drops or does not re-deliver subscriptions across the power transition.
-  3. Foreground-service / binder death / process lifecycle kills the listener (A15 stricter rules).
+- **access**: `READ` | `WRITE` | `READ_WRITE` (system props: only allowed modes)
+- **changeMode**: `STATIC` | `ON_CHANGE` | `CONTINUOUS`
+- **area**: GLOBAL or area bitmasks; per-area access must be consistent
+- **sample rate**: continuous properties only; subscription Hz must be within min/max
 
-  Diagnostic order (do not skip):
-  1. Confirm VSS→VHAL mapping is correct.
-  2. Confirm VHAL is emitting after ignition.
-  3. Confirm CarPropertyService received the value.
-  4. Check whether the *client* still has an active registration after resume
-     (register calls only in onCreate/onStart and never re-issued in power / lifecycle listeners).
+AIDL `IVehicle` surface (conceptual):
 
-  Preferred fix locations (customer-first):
-  - OEM HMI / settings app: re-register inside power-policy listener or onResume / after Car reconnect.
-    Prefer a single helper used by both initial registration and re-registration.
-  - Only if the drop is inside CarService: power-policy handlers + subscription bookkeeping.
+- `getAllPropConfigs` / `getPropConfigs`
+- `getValues` / `setValues` (async + callback)
+- `subscribe` / `unsubscribe` with `SubscribeOptions` (propId, areaId, sample rate)
 
-  Do not change the VSS mapping or DefaultProperties.json when mapping + VHAL emission are already correct.
-  Do not replace the event-driven subscription with polling.
+Status handling that causes real field bugs:
 
-- **Wrong/empty value for a signal** → VSS→VHAL mapping (wrong property id / areaId / name), or
-  VHAL default config.
-- **NPE opening a settings/seat/zone page** → null areaId for single-zone; missing RRO/config overlay.
-- **Works on AOSP build, breaks on OEM build** → the bug is in the OEM overlay (vendor/device), not AOSP.
-- **Permission/denial** → SELinux policy or manifest, not the feature code.
+- `OK` — success
+- `TRY_AGAIN` — transient; client should retry (not treat as permanent failure)
+- `NOT_AVAILABLE` — e.g. property powered off / not ready
+- `INVALID_ARG` — bad propId/areaId/value
+- `INTERNAL_ERROR` — HAL/backend failure
 
-## Step 4 — suspect the BOUNDARIES between layers
-Cross-layer bugs usually live at the seams, not inside one file:
-- VSS↔VHAL: mismatched signal name / property id / areaId
-- AIDL version skew: interface changed but impl not regenerated
-- CarService↔VHAL: property registered in HAL but not exposed by CarService config
-When two adjacent layers each "look correct", inspect the contract between them.
+Vendor properties: last resort; default permission
+`android.car.Car.PERMISSION_VENDOR_EXTENSION`; prefer system properties first
+(AOSP special-properties guidance).
 
-## Step 5 — decide AOSP vs customer
-If the failing layer has both an AOSP file and a vendor/device override, inspect the **override first**
-— the OEM copy is where behavior diverges. Only blame AOSP when no overlay exists for that path.
+## 4. Subscription and "value not updating"
+
+For continuous properties, VHAL emits by sample rate (or bus rate). For
+ON_CHANGE, emit on value/status change.
+
+Typical break points when mapping is correct but UI is stale:
+
+1. **Client** did not re-register `CarPropertyManager.registerCallback` /
+   listener after Car connection drop or process death.
+2. **Power policy** transition tore down listeners; no re-subscribe on
+   `CarPowerManager` policy change / lifecycle resume.
+3. **CarService** subscription not restored after VHAL binder death.
+4. **VHAL** unsubscribe on sleep and never subscribe again on wake.
+5. AreaId mismatch: subscribed area ≠ producing area.
+
+Trace one property end-to-end before proposing a patch.
+
+## 5. Power policy (AOSP automotive power)
+
+Car power policy daemon is the system source of truth for power policy state.
+It interacts with VHAL via special properties, including:
+
+- `POWER_POLICY_REQ` / `POWER_POLICY_GROUP_REQ` (VHAL → policy daemon)
+- `CURRENT_POWER_POLICY` (daemon → VHAL when others change policy)
+
+Native clients can use `ICarPowerPolicyServer` / change callbacks.
+Java privileged modules use `CarPowerManager` (get/apply policy, register
+listeners). App-layer fixes that ignore power policy will regress on ignition
+cycles.
+
+## 6. SELinux (Android model, automotive clients)
+
+- Do not edit platform `system/sepolicy` for OEM features; put policy under
+  `device/<oem>/<device>/sepolicy` and `BOARD_SEPOLICY_DIRS`.
+- Vendor types should be namespaced (`vendor_`) to avoid duplicate type errors.
+- Init-started daemons need their **own domain** (`init_daemon_domain`), not
+  shared permissive domains.
+- `neverallow` rules are enforced across devices — do not "fix" denials by
+  punching holes that violate neverallows; relabel or move the access to an
+  allowed path.
+- Native VHAL clients need explicit binder allows; apps go through CarService.
+
+Log pattern: `avc: denied { ... } for ... scontext=... tcontext=...`.
+Fix domain is sepolicy, not the Java caller, when the call path is intentional.
+
+## 7. Investigation order (customer-first)
+
+1. Confirm symptom and property/signal id from logcat (no invented ids).
+2. Search `vendor/` + `device/` overlays for mapping, RRO, custom HAL, HMI.
+3. Walk the data path hop-by-hop until the first wrong/missing value.
+4. Only then change AOSP paths; prefer minimal OEM overlay fixes.
+5. Any VHAL / AIDL / SELinux / power change → human review.
+
+## 8. What this skill is not
+
+Not a full Android framework encyclopedia (Activity, media, telephony, ...).
+Not a substitute for code evidence from RAG. Use tools; bind to retrieved paths.

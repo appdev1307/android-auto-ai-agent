@@ -112,6 +112,13 @@ _HORIZONTAL_PACKS = [
         "when_keywords": ("native", "hal", ".cpp", "gtest", "vts"),
         "when_path": ("hardware/interfaces", ".cpp", ".cc", ".h"),
     },
+    {
+        "id": "selinux_linux",
+        "file_substrings": ("selinux_linux", "selinux"),
+        "when_layers": {"selinux", "native", "vhal"},
+        "when_keywords": ("selinux", "avc denied", "neverallow", "sepolicy"),
+        "when_path": (".te", "sepolicy", "file_contexts"),
+    },
 ]
 
 # Structured output line specialists must emit (consensus parser key).
