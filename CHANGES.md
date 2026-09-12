@@ -63,20 +63,18 @@ demonstrate the customer/OEM-first retrieval it was built around.
 11. **hybrid.py `read_file`** — confined to `aosp_root` (the LLM controls the
     path; `/etc/passwd` etc. is refused).
 
-12. **requirements.txt** — dropped unused deps (typer, aiofiles, loguru);
-    tree-sitter left commented as future AST-chunking (the chunker is still
-    regex-based — "code-aware" is aspirational until that lands).
+12. **requirements.txt** — dropped unused deps (typer, aiofiles, loguru).
+    *(Historical note: tree-sitter was still commented here; enabled later in Updates 12–14.)*
 
-## Not done (deliberately out of PoC scope)
+## Later superseded / still open
 
-- Real tree-sitter AST chunking (option B territory).
-- Structured machine-readable `patches[]` / `unit_tests[]` extraction.
-- `git apply --check` patch validation harness.
-- Labeled smoke/eval set — recommended next: 10–15 real bugs from your
-  actual project tree, wired as a regression check before you tune ranking
-  further. `data/config.yaml` `index_roots` + `customer_path_boost` still
-  point at generic AOSP layout — repoint them at your real OEM tree before
-  indexing.
+The following were listed as out of scope in the first pass; status as of Update 28:
+
+- ~~Real tree-sitter AST chunking~~ → **done** (Updates 12–14: Java/Kotlin/C++ AST + parse oracle).
+- ~~`git apply --check`~~ → replaced by in-memory apply + tree-sitter parse (Updates 7–8, 14).
+- Structured machine-readable `patches[]` / `unit_tests[]` extraction → still open (finalize emits prose/sections).
+- Labeled eval harness exists (`eval/`); filling **gold labels from real OEM bugs** is still on the user.
+- Repoint `index_roots` / scopes at the real OEM tree before production indexing.
 
 ---
 
@@ -88,8 +86,9 @@ demonstrate the customer/OEM-first retrieval it was built around.
   identifiers). Extra safe signals for vendor trees: `.hal` ext + `hidl_interface`
   in `Android.bp`. Verified: catches `/vehicle/2.0/*.hal`, does NOT drop `*.aidl`.
 - `guess_layer()` tags HIDL as `layer="hidl_legacy"`.
-- `hybrid.py:_apply_code_priors` — `hidl_legacy` gets `prior_hidl_penalty` (0.30)
-  UNLESS the query is about HIDL/migration. Kept indexable, never outranks AIDL for A14+.
+- `hybrid.py:_apply_code_priors` — *(historical)* originally applied
+  `prior_hidl_penalty` (0.30) unless the query was about HIDL/migration.
+  **Superseded by Update 26** (Stage 2 hard drop; config key removed).
 
 ## Multi-tenant knowledge store — option B, physical isolation (mục 5 + 6)
 New module `retrieval/store.py` — 5 design patterns, each killing one risk:
@@ -116,7 +115,8 @@ Wiring:
   writes `manifest.json` (embed_model + git_sha) for the guard + incremental re-index.
 - `main.py` — `--customer/--project/--aosp-version` (explicit, never auto-picked).
 - `state.py`/`nodes.py` — `tenant` in state; retriever cache keyed by root+tenant.
-- `config.yaml` — `stores_root`, `default_tenant`, `prior_customer_store`, `prior_hidl_penalty`.
+- `config.yaml` — `stores_root`, `default_tenant`, `prior_customer_store`
+  (and originally `prior_hidl_penalty`, **removed in Update 26**).
 
 Guards verified (unit-tested): frozen Tenant, refuse 2 customer layers, refuse path escape,
 embed-model mismatch raises.
@@ -278,7 +278,7 @@ against — without it, "better" is a guess.
 
 # Update 10 — Diagnostic playbook + custom-hints mechanism
 
-## Diagnostic playbook (skills/android_automotive.md)
+## Diagnostic playbook (`skills/android_automotive.md` → later `skills/10-android_automotive.md`)
 Prompt told the model WHAT to output but not HOW to diagnose. Added a 5-step playbook:
 symptom→layer map (logcat signatures), trace-the-data-path strategy, symptom→common-suspect
 table, boundary-bug guidance (VSS↔VHAL/AIDL seams), and AOSP-vs-customer decision. Loaded
@@ -408,7 +408,7 @@ failure modes.
   + output contract (is the root cause here? which file? why, grounded in a snippet).
 - `agent/specialists.py` — `make_specialists_node(llm, get_retriever)`: groups retrieved
   evidence by layer, runs the matching specialist per layer (capped at MAX_SPECIALISTS=3 to
-  bound cost), returns per-layer assessments. `format_specialist_notes` renders them.
+  bound cost; **raised to 5 in Update 27b**), returns per-layer assessments. `format_specialist_notes` renders them.
 - Graph: `agent →(should_continue)→ tools | specialists`, `specialists → finalize`. Finalize
   folds the specialist assessments into its context before ranking/patching.
 - `tools_def.get_retriever()` added; `state.specialist_notes` added; main seeds it.
@@ -476,7 +476,7 @@ specific. Per project design (and operator feedback), `hints/` is reserved for:
 
 General diagnostic patterns (subscription drops after ignition/resume, diagnostic
 order, preferred fix locations) were moved into `skills/android_automotive.md`
-where framework knowledge belongs.
+where framework knowledge belongs (now `skills/10-android_automotive.md`).
 
 `hints/` stays clean for true OEM overlays only.
 
@@ -484,7 +484,7 @@ where framework knowledge belongs.
 
 # Update 22 — Align finalize / few-shot / system with patch_and_ut
 
-- agent/nodes.py finalize prompt now references skills/patch_and_ut.md and
+- agent/nodes.py finalize prompt now references skills/patch_and_ut.md (now `skills/20-patch_and_ut.md`) and
   asks for concrete UT ideas (AAOS patterns only) + forced human-review wording.
 - prompts/fewshot_localize.md: added Example 3 (localization + minimal patch
   description + named UT ideas) for the ignition/resume speed case.
@@ -567,11 +567,11 @@ omit+no stores_root) checked in isolation; `main.py` compiles.
 
 # Update 25 — No fake diffs; AAOS-native UT frameworks
 
-- skills/patch_and_ut.md: hard anti-hallucination (§0); unified diff only if
+- skills/20-patch_and_ut.md (was patch_and_ut.md): hard anti-hallucination (§0); unified diff only if
   read_source succeeded; SELinux rule; unit tests must name Framework
   (JUnit4+Robolectric/instrumentation | GoogleTest+gmock | VTS) + TestName +
   setup/action/assert.
-- prompts/system.md + skills/AGENTS.md + finalize summary_prompt: same rules.
+- prompts/system.md + skills/00-AGENTS.md + finalize summary_prompt: same rules.
 - fewshot Example 3: UT section uses Framework / Target / setup-action-assert form.
 - Model must not emit fabricated ---/+++/@@ when the file was not read.
 ---
@@ -598,7 +598,7 @@ supersedes that Stage-2 behavior.
 
 # Update 27 — Vertical specialists + horizontal skill packs + agent contract
 
-## Vertical specialists (graph nodes, capped at 3)
+## Vertical specialists (graph nodes; cap was 3 here, **5 since Update 27b**)
 Extended set: vhal | aidl | binder | carservice | hmi | vss | startup_power |
 frameworks (+ native, selinux when tagged).
 
@@ -613,7 +613,7 @@ New prompts: `prompts/specialists/{binder,startup_power,frameworks}.md`
 
 ## Horizontal skill packs (no extra LLM call)
 Auto-loaded from `skills/*.md` (sorted). Injected into specialist system prompts
-when layer/keywords/paths match:
+when layer/keywords/paths match (initial set; **Update 28** adds binder/services/AACP):
 - `30-aaos_app.md` — Car UI / CarPropertyManager / HMI lifecycle
 - `40-sdv_vss.md` — COVESA VSS / signal mapping
 - `50-native_hal.md` — native HAL / C++ services
@@ -647,3 +647,16 @@ Drop a new `skills/60-foo.md` to extend horizontal knowledge without code change
   force_human_review.
 - CONTRACT §7 documents consensus rules for all roles.
 
+# Update 28 — Binder / services / AACP (Android Auto + CarPlay) skills
+
+AACP = **Android Auto + Apple CarPlay** (phone projection), distinct from native AAOS apps.
+
+- New skills (auto-loaded):
+  - `skills/32-binder_ipc.md` — Binder parcel limits, death recipients, threads, oneway
+  - `skills/33-android_services.md` — CarService / bind lifecycle / FGS
+  - `skills/34-aacp_projection.md` — Android Auto + CarPlay session/transport vs VHAL path
+- Strengthened: `30-aaos_app.md`, `10-android_automotive.md` (symptom rows), `00-AGENTS.md`
+- `agent/specialists.py` — horizontal packs + keywords (`android auto`, `carplay`, …)
+- `prompts/specialists/binder.md`, `hmi.md` — aligned (projection ≠ property mapping)
+- Removed legacy unnumbered duplicates: `skills/AGENTS.md`, `android_automotive.md`,
+  `patch_and_ut.md` (content lives in `00-` / `10-` / `20-` files only)

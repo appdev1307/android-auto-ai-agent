@@ -3,18 +3,21 @@
 **Real hybrid RAG** (dense + BM25 + exact) + tool-calling ReAct agent for the
 **Android 15 full stack**:
 
-`HMI → CarService → AIDL → VHAL → VSS`, ranked **customer/OEM-first** (`vendor/`, `device/`),
-with **physical IP isolation per customer** (multi-tenant, option B).
+`HMI → CarService → AIDL/Binder → VHAL → VSS` (+ power / SELinux when relevant),
+ranked **customer/OEM-first** (`vendor/`, `device/`), with **physical IP isolation
+per customer** (multi-tenant, option B).
 
 Not a prompt-only skeleton. Includes:
-- Structural chunking + Chroma vector index + BM25 corpus
+- Structural / AST-aware chunking + Chroma vector index + BM25 corpus
 - Hybrid retrieve (dense + BM25 + ripgrep) → RRF → normalize → customer/OEM priors → cross-encoder rerank
-- Legacy **HIDL excluded**, tagged `hidl_legacy` and down-weighted (A14+ wants AIDL)
+- Legacy **HIDL hard-excluded** at index time and hard-dropped at retrieval (A14+ wants AIDL)
 - Aggressive index filter (drops prebuilts/test/external/generated) + **incremental re-index** by git SHA
 - Multi-tenant stores: shared AOSP base + per-customer isolated overlay
 - Tools: `hybrid_search`, `read_source`, `lookup_vss_signal`, `find_aidl_interface`, `find_symbol`
-- ReAct tool loop (LangGraph) + forced human-review on VHAL/VSS/AIDL/SELinux/power
-- vLLM OpenAI-compatible backend
+- ReAct tool loop (LangGraph) → **committed diagnosis** → **vertical specialists** (≤5) + consensus → finalize
+- Patch grounded on the real file (apply + tree-sitter parse oracle) + AAOS-native UT ideas
+- Forced human-review on VHAL / VSS / AIDL / SELinux / power / binder / projection seams
+- OpenAI-compatible LLM backend (vLLM on server, **Ollama on Colab**)
 
 ---
 
@@ -40,7 +43,7 @@ chmod a+x ~/bin/repo && export PATH=~/bin:$PATH
 # fresh Android 15 checkout
 mkdir -p ~/aosp15 && cd ~/aosp15
 repo init -u https://android.googlesource.com/platform/manifest -b android-15.0.0_r1
-repo sync -c -j8           # -c: current branch only; full tree ~150 GB, takes hours
+repo sync -c -j8           # -c: current branch only; full tree is large, takes hours
 export AOSP_ROOT=~/aosp15
 ```
 
@@ -65,13 +68,19 @@ After a later `repo sync`, re-index only what changed:
 python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --aosp-version aosp15 --incremental
 ```
 
-## 4. Start vLLM
+## 4. Start the LLM backend
+
+**Server / workstation (vLLM example):**
 
 ```bash
 bash scripts/start_vllm.sh
 export OPENAI_API_BASE=http://127.0.0.1:8000/v1
 export OPENAI_API_KEY=dummy
 ```
+
+**Colab (dev):** use `AAOS_Agent_Colab.ipynb` — it starts **Ollama** (OpenAI-compatible on
+`http://127.0.0.1:11434/v1`) to avoid vLLM / torch / flashinfer install issues on Colab
+Python. Point `data/config.yaml` `model.api_base` at that endpoint (the notebook does this).
 
 ## 5. Run the agent
 
@@ -80,8 +89,9 @@ python -m agent.main --aosp-root $AOSP_ROOT --aosp-version aosp15 \
   --bug "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON"
 ```
 
-Output: ranked candidate files (by layer), a root-cause hypothesis, a proposed unified
-diff (or N/A), and a `needs_human_review` flag.
+Output: committed diagnosis (file / layer / symbols), specialist verdicts + consensus,
+ranked evidence, a **grounded** unified diff when the source file was read (or N/A),
+AAOS-native unit-test ideas, and a `needs_human_review` flag.
 
 With no `--customer`, the agent runs **base-only**: it loads the shared `_base` store
 from step 3 via the config `default_tenant` (customer `base`). If that store isn't built
@@ -144,29 +154,48 @@ Multifaceted-RAG is the natural comparison for the isolation design.
 
 ---
 
-## Custom hints (add your own knowledge, no code edit)
+## Skills and custom hints
 
-The agent's diagnostic playbook lives in `skills/android_automotive.md` (symptom→layer,
-trace strategy, common suspects). To add your **own** project knowledge — known-flaky
-modules, OEM naming, "signal X maps via file Y" — drop a `*.md` file into `hints/`:
+### Framework skills (`skills/*.md`, auto-loaded)
+
+Global skills load in filename order (`00-`, `10-`, …). `CONTRACT.md` is applied first so
+every role shares the same rules. No code change to add a pack — drop a new `*.md` and restart.
+
+| File | Role |
+|------|------|
+| `CONTRACT.md` | Shared agent rules (validate committed diagnosis; no invented paths) |
+| `00-AGENTS.md` | Operating rules / customer-first |
+| `10-android_automotive.md` | AAOS diagnostic playbook (logcat→layer, data path, power, SELinux) |
+| `20-patch_and_ut.md` | Patch + UT rules (AOSP style; no fake diffs) |
+| `30-aaos_app.md` | Native AAOS / Car UI apps |
+| `32-binder_ipc.md` | Binder / AIDL IPC |
+| `33-android_services.md` | CarService and Android service lifecycle |
+| `34-aacp_projection.md` | **AACP = Android Auto + Apple CarPlay** (projection ≠ VHAL mapping) |
+| `40-sdv_vss.md` | VSS / COVESA mapping |
+| `50-native_hal.md` | Native HAL / C++ |
+| `60-selinux_linux.md` | SELinux + Linux service basics |
+
+### Operator hints (`hints/*.md`)
+
+For **customer-specific** knowledge only (OEM naming, known handlers, chipset quirks):
 
 ```
 hints/
-  10-power-bugs.md      # your notes; auto-appended to the system prompt
+  10-oem-power-handler.md
   20-vss-mapping.md
 ```
 
-Files load in filename order (prefix `00-`, `10-`, …). Restart to pick up changes. See
-`hints/HOWTO.txt`. You can also point elsewhere via `data/config.yaml`:
+Files load in filename order. Restart to pick up changes. See `hints/HOWTO.txt`. Config:
 
 ```yaml
 prompt:
   hints_dir: "hints"
-  hint_files: ["path/to/extra.md"]
+  hint_files: []
+  skills_dir: "skills"
+  skill_files: []
 ```
 
-Hints steer the model's *reasoning*; they don't replace retrieval — if the evidence
-doesn't contain the right file, a hint won't conjure it.
+Hints steer reasoning; they do not replace retrieval.
 
 ---
 
@@ -196,22 +225,24 @@ later improvement (prompt, model, LoRA) is measured against.
 
 ## Run on Colab (dev phase, no server)
 
-For development you don't need a server or the full 150 GB tree. Index the automotive
+For development you don't need a server or the full AOSP tree. Index the automotive
 **subset once → to Google Drive**, then develop against that persistent index.
 
-Use the notebook `AAOS_Agent_Colab_A100.ipynb` (A100 80GB runtime). It:
-1. mounts Drive (index + model cache persist there),
-2. shallow-clones only `packages/services/Car` + `hardware/interfaces/automotive`
-   (~hundreds of MB, not full AOSP),
+Use the notebook `AAOS_Agent_Colab.ipynb`. It:
+1. mounts Drive (index persists there),
+2. shallow-clones automotive-relevant projects (not full AOSP),
 3. indexes that subset to `stores_root` on Drive (skips if already built),
-4. serves Qwen2.5-Coder-32B via vLLM and runs the agent.
+4. starts **Ollama** with a coding model (e.g. `qwen2.5-coder:32b` or a lighter 14B)
+   and runs the agent.
 
-**Index vs source.** The index (Chroma + BM25) is the durable asset — it lives on Drive
-and is reused every session. The source subset is cheap; it's re-cloned per session.
-Keeping it on disk lets the ripgrep channel + `read_source` work. If you drop it, the
-agent still runs in **index-only mode** (dense + BM25 carry the code content; exact-search
-and `read_source` are disabled, and it says so at startup). Full-AOSP + `--incremental`
-re-sync is a production concern, not needed for dev.
+**Why Ollama on Colab:** vLLM often fails on Colab due to Python/CUDA/torch/flashinfer
+wheel mismatches and long source builds. Ollama ships a prebuilt binary and still exposes
+an OpenAI-compatible API the agent already uses.
+
+**Index vs source.** The index (Chroma + BM25) is the durable asset on Drive. The source
+subset is cheap and may be re-cloned per session so ripgrep + `read_source` work. Without
+source, the agent still runs in **index-only mode** (dense + BM25 only; exact-search and
+`read_source` degrade gracefully). Full-AOSP + `--incremental` is a production concern.
 
 ---
 
@@ -221,37 +252,41 @@ re-sync is a production concern, not needed for dev.
 Bug/logcat
   → init_retriever  (base ∪ customer stores: Chroma + BM25 + rg)
   → agent (LLM + tools)  ⇄  tools (ToolNode)     # ReAct loop
-  → finalize (ranked files, root cause, unified diff, human-review flag)
+  → commit_diagnosis      # single source of truth (file/layer/symbols)
+  → specialists (≤ agent.max_specialists, default 5)
+       + horizontal skill injection + VERDICT consensus
+  → finalize (render diagnosis, grounded patch, UT ideas, human-review)
 ```
 
-Four layers wired through `AgentState`: **graph** (LangGraph orchestration), **tools**
+Vertical specialists (examples): `vhal`, `aidl`, `binder`, `carservice`, `hmi`, `vss`,
+`startup_power`, `frameworks` (+ `native` / `selinux` when tagged). Router uses committed
+layer, path prefixes, and bug keywords (priority pass for power / binder / SELinux).
+
+Four layers wired through `AgentState`: **graph** (LangGraph), **tools**
 (`agent/tools_def.py`), **retrieval** (`retrieval/hybrid.py` + `store.py`), **safety**
-(`finalize`). See `CHANGES.md` for the full change history.
+(`finalize` + CONTRACT). See `CHANGES.md` for the full change history.
 
 ### Retrieval pipeline (`retrieval/hybrid.py`)
 
-- **Dense**: sentence-transformers embeddings over structural chunks (Chroma, cosine)
+- **Dense**: sentence-transformers embeddings over structural/AST chunks (Chroma, cosine)
 - **Sparse**: BM25 over the same chunks
 - **Exact**: ripgrep over the roots that were actually indexed — recorded in the store
-  manifest (`index_roots`/`scope`) so exact-search matches the vectorized scope instead of
-  a divergent hard-coded list (catches rare symbols embeddings miss)
-- **Fuse**: RRF (rank-based, scale-free) → **min-max normalize to [0,1]** → additive
-  customer/OEM + layer priors → cross-encoder rerank with **sigmoid-normalized** CE scores
-  blended against the prior-boosted base — so the customer-first boost survives rerank
-  instead of being wiped by raw CE logits.
-- **HIDL**: excluded at index time by path (+ `.hal` / `hidl_interface` signals); any that
-  slip through are tagged `hidl_legacy` and penalized unless the query is about HIDL/migration.
+  manifest (`index_roots`/`scope`) so exact-search matches the vectorized scope
+- **Fuse**: RRF → **min-max normalize to [0,1]** → additive customer/OEM + layer priors →
+  cross-encoder rerank with **sigmoid-normalized** CE scores blended against the
+  prior-boosted base — so the customer-first boost survives rerank
+- **HIDL (two hard gates)**:
+  1. Index time: `chunker.is_hidl` → `should_index = False` (path markers, `.hal`, `hidl_interface`)
+  2. Retrieval time: hard **drop** any slipped `hidl_legacy` / HIDL path hit unless the
+     query is explicitly about HIDL / migration
 
 ### Index filter & incremental (`retrieval/chunker.py`, `indexer.py`)
 
 - `should_index(path, mode)` — `base` mode drops prebuilts/test/external/generated/oversized;
   `customer` mode keeps almost everything (customer patches land anywhere).
 - `--incremental` — `git diff` the tree's HEAD against the last indexed SHA and touch only
-  changed/added/deleted files in both Chroma and BM25 (pure local diff; no fetching). Changed
-  files are filtered to the same scope roots recorded in the manifest, so incremental and a
-  full build stay in sync.
-- The manifest (`manifest.json`) records `embed_model`, `git_sha`, and the `index_roots`/`scope`
-  used — reused by the embed-model guard, incremental diffs, and exact-search root resolution.
+  changed/added/deleted files in both Chroma and BM25 (pure local diff; no fetching).
+- Manifest records `embed_model`, `git_sha`, and `index_roots`/`scope`.
 
 ### Tools (`agent/tools_def.py`)
 
@@ -296,11 +331,12 @@ to root, embed-model mismatch raises.
 
 ## Config
 
-`data/config.yaml` — model endpoint, `stores_root`, `default_tenant` (the tenant used when
-`--customer` is omitted; `customer: base` => base-only), index roots, embed model, ranking
-weights (`ce_blend`, `prior_customer`, `prior_customer_store`, `prior_hidl_penalty`),
-`max_tool_iters`, safety (`auto_apply: false`). Swap the embed model to a code-embedding model
-when you can afford it.
+`data/config.yaml` — model endpoint, `stores_root`, `default_tenant` (tenant when
+`--customer` is omitted; `customer: base` => base-only), index scopes, embed model, ranking
+weights (`ce_blend`, `prior_customer`, `prior_customer_store`), `max_tool_iters`,
+`max_specialists` (default 5), safety (`auto_apply: false`), `prompt.skills_dir` /
+`prompt.hints_dir`. Changing `embed_model` invalidates existing indexes — rebuild with
+`--reset`.
 
 ---
 
