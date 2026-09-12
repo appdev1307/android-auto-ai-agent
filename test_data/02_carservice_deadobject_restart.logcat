@@ -1,0 +1,14 @@
+# BUG: App crashes with DeadObjectException after CarService restarts; Car instance not re-created
+# LAYER: carservice
+# SOURCE PATTERN: AOSP — "If CarService crashes it restarts; all Car instances from Car.createCar are invalidated"
+--------- beginning of system
+01-06 10:03:44.512  1180  1180 E CarService: Service com.android.car crashed, restarting via CarServiceHelperService
+01-06 10:03:44.980  1180  1180 I CarService: CarService.initAllServices done (restart)
+01-06 10:03:45.331  3120  3120 W Car: Car service disconnected; Car instance from Car.createCar is now invalidated
+01-06 10:03:45.402  3120  3120 E MyClusterApp: getProperty failed after service restart
+	at android.os.BinderProxy.transactNative(Binder.java)
+	at android.car.hardware.property.ICarProperty$Stub$Proxy.getProperty(ICarProperty.java:512)
+	at android.car.hardware.property.CarPropertyManager.getProperty(CarPropertyManager.java:1041)
+	at com.example.cluster.SpeedRepository.readSpeed(SpeedRepository.java:88)
+01-06 10:03:45.404  3120  3120 E MyClusterApp: android.os.DeadObjectException
+01-06 10:03:45.560  1180  1206 W CarPropertyService: client re-registration missing after restart for PERF_VEHICLE_SPEED

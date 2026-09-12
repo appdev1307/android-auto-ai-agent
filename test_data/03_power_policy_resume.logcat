@@ -1,0 +1,13 @@
+# BUG: After suspend-to-RAM resume, display power policy not applied; CarPowerPolicyListener not notified
+# LAYER: startup_power
+# SOURCE PATTERN: AOSP CarPowerManagementService / CarPowerManager.CarPowerPolicyListener
+--------- beginning of system
+01-06 06:15:02.771  1180  1201 I CarPowerManagementService: handleStateChange SUSPEND_EXIT (resume from STR)
+01-06 06:15:02.802  1180  1201 D CarPowerManagementService: applyPowerPolicy id=system_power_policy_all_on
+01-06 06:15:02.999  1180  1201 W CarPowerManagementService: power policy applied but no listeners notified (0 registered handlers this cycle)
+01-06 06:15:03.140  2510  2510 W CarPowerManager: CarPowerPolicyListener.onPolicyChanged not called after resume; display stays OFF
+01-06 06:15:03.221  1180  1201 E CarPowerManagementService: notifyPowerPolicyChange failed
+	at com.android.car.power.CarPowerManagementService.notifyPowerPolicyChange(CarPowerManagementService.java:1442)
+	at com.android.car.power.CarPowerManagementService.applyPowerPolicy(CarPowerManagementService.java:1201)
+	at com.android.car.power.CarPowerManagementService.handleOn(CarPowerManagementService.java:905)
+01-06 06:15:03.560  2510  2510 D SystemUI: display remains blank after resume; awaiting power policy

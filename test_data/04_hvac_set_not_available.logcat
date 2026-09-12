@@ -1,0 +1,13 @@
+# BUG: Setting HVAC temperature throws PropertyNotAvailableException when HVAC power is off
+# LAYER: aidl / vhal
+# SOURCE PATTERN: AOSP VHAL — set on power-gated property returns StatusCode NOT_AVAILABLE; onPropertySetError
+--------- beginning of main
+01-06 12:41:19.006  1602  1655 I vehicle-hal: setValues HVAC_TEMPERATURE_SET areaId=ROW_1_LEFT value=22.0
+01-06 12:41:19.010  1602  1655 W vehicle-hal: HVAC power is OFF; returning StatusCode::NOT_AVAILABLE for HVAC_TEMPERATURE_SET
+01-06 12:41:19.012  1602  1655 E VehicleHal: onPropertySetError(errorCode=NOT_AVAILABLE, propId=HVAC_TEMPERATURE_SET, areaId=ROW_1_LEFT)
+01-06 12:41:19.088  2701  2701 E CarPropertyManager: setProperty failed for HVAC_TEMPERATURE_SET
+	at android.car.hardware.property.CarPropertyManager.handleCarServiceSpecificException(CarPropertyManager.java:1998)
+	at android.car.hardware.property.CarPropertyManager.setProperty(CarPropertyManager.java:1233)
+	at com.example.hvac.ClimateController.onTempSelected(ClimateController.java:141)
+01-06 12:41:19.090  2701  2701 E ClimateController: android.car.hardware.property.PropertyNotAvailableException: NOT_AVAILABLE_DISABLED
+01-06 12:41:19.190  1602  1655 D vehicle-hal: check IVehicle onSetValues result handling and HVAC_POWER_ON gating in DefaultVehicleHal

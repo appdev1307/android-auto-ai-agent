@@ -1,0 +1,13 @@
+# BUG: PERF_VEHICLE_SPEED reads as 0 in cluster — VHAL declares speed as INT32 instead of FLOAT
+# LAYER: vhal / native (C++)
+# SOURCE PATTERN: AOSP VHAL VtsHalAutomotiveVehicle_TargetTest.cpp property-type validation
+--------- beginning of main
+01-06 08:22:10.114  1602  1602 I VehicleService: registering IVehicle: android.hardware.automotive.vehicle.IVehicle/default
+01-06 08:22:11.201  1602  1655 E vehicle-hal: DefaultVehicleHal: getValues for prop=0x11600207 (PERF_VEHICLE_SPEED) type mismatch: config=INT32 expected=FLOAT
+01-06 08:22:11.203  1602  1655 E VehicleHal: onPropertySetError code=INTERNAL_ERROR prop=0x11600207 areaId=0
+01-06 08:22:11.290  2044  2044 W CarPropertyManager: onErrorEvent PERF_VEHICLE_SPEED errorCode=CarInternalErrorException status=STATUS_ERROR
+01-06 08:22:11.301  2044  2044 D ClusterHomeService: speed=0.0 (property returned STATUS_ERROR)
+01-06 08:22:11.402  1602  1655 E vehicle-hal: getValue returned StatusCode::INTERNAL_ERROR for PERF_VEHICLE_SPEED
+	at aidl::android::hardware::automotive::vehicle::DefaultVehicleHal::getValues(DefaultVehicleHal.cpp:214)
+	at android::hardware::automotive::vehicle::VehicleHalManager::handleGetValues(VehicleHalManager.cpp:333)
+01-06 08:22:11.410  1602  1655 W vehicle-hal: check VehiclePropConfig for PERF_VEHICLE_SPEED: value_type must be FLOAT per VehiclePropertyType

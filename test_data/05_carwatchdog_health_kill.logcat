@@ -1,0 +1,12 @@
+# BUG: car watchdog kills app for unresponsive health check / I-O overuse after boot
+# LAYER: native / carservice (watchdog)
+# SOURCE PATTERN: AOSP car watchdog daemon (carwatchdogd) + CarWatchdogService health monitoring
+--------- beginning of system
+01-06 07:58:31.220   980   980 I carwatchdogd: HealthCheck cycle: monitoring 42 clients
+01-06 07:58:46.014   980   980 W carwatchdogd: com.example.telemetry not responding to ping (missed 2 checks)
+01-06 07:58:46.020  1180  1233 W CarWatchdogService: process com.example.telemetry unresponsive; state=NOT_RESPONDING
+01-06 07:58:46.101   980   980 E carwatchdogd: I/O overuse: com.example.telemetry wrote 3.2GB in foreground window; over threshold
+01-06 07:58:46.140  1180  1233 E CarWatchdogService: killing com.example.telemetry (health check failed)
+	at com.android.car.watchdog.CarWatchdogService.onClientDeath(CarWatchdogService.java:701)
+	at com.android.car.watchdog.WatchdogProcessHandler.checkIfAlive(WatchdogProcessHandler.java:388)
+01-06 07:58:46.320   980   980 I carwatchdogd: dumping watchdogd state to /data/system/car/watchdog
