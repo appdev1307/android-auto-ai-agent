@@ -16,7 +16,7 @@ from agent.tools_def import ALL_TOOLS, set_retriever, get_retriever
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
 from retrieval.chunker import (apply_unified_diff, parse_ok, grammar_missing, guess_layer,
-                               clang_format_check, symbol_window)
+                               clang_format_check, symbol_window, read_enclosing_node)
 from agent.specialists import make_specialists_node, format_specialist_notes
 from agent.diagnosis import (Diagnosis, collect_evidence, commit_diagnosis_record,
                              render_diagnosis)
@@ -188,10 +188,17 @@ _RELOC_TYPE = re.compile(r"\b[A-Z][A-Za-z0-9]+(?:Service|Manager|Hal|HAL|Policy|
 _RELOC_PATH = re.compile(r"\b[\w./-]+\.(?:java|kt|cpp|cc|h|aidl|vspec|json)\b")
 
 
-def _relocalize_hints(notes: list, exclude_file: str = "") -> list[str]:
+def _relocalize_hints(notes: list, exclude_file: str = "",
+                      extra_anchors: list | None = None) -> list[str]:
     """Mine concrete file/symbol names the DISAGREE-ing specialists pointed at
     (e.g. 'CarPropertyService', 'CarPowerManagementService'). Excludes the
     already-rejected target so re-seeding doesn't pull the same wrong file back.
+
+    `extra_anchors` folds in the COMMITTED symbols / property_ids: the regexes
+    below only catch CamelCase types, so an ALL_CAPS property id like
+    PERF_VEHICLE_SPEED — which a specialist means when it says 'the implementation
+    of PERF_VEHICLE_SPEED' — would otherwise yield zero hints and silently skip
+    re-localization. These are real committed facts, not invented text.
     """
     excl_stem = ""
     if exclude_file:
@@ -203,6 +210,7 @@ def _relocalize_hints(notes: list, exclude_file: str = "") -> list[str]:
         txt = n.get("assessment") or ""
         hints += _RELOC_TYPE.findall(txt)
         hints += _RELOC_PATH.findall(txt)
+    hints += [a for a in (extra_anchors or []) if a]
     seen: set[str] = set()
     out: list[str] = []
     for h in hints:
@@ -231,14 +239,38 @@ def relocalize(state: AgentState) -> Dict[str, Any]:
     notes = state.get("specialist_notes") or []
     bug = (state.get("bug_report") or "").strip()
     count = int(state.get("relocalize_count", 0)) + 1
-    hints = _relocalize_hints(notes, exclude_file=dx.get("file", ""))
+    anchors = list(dx.get("property_ids") or []) + list(dx.get("symbols") or [])
+    hints = _relocalize_hints(notes, exclude_file=dx.get("file", ""),
+                              extra_anchors=anchors)
     if r is None or not hints:
         return {"relocalize_count": count}
-    query = (bug + " " + " ".join(hints[:6])).strip()
+    # If a specialist says the fault is in the IMPLEMENTATION (interface file
+    # rejected as the wrong layer), bias both the query and the ranking toward impl
+    # source instead of another interface declaration.
+    impl_cue = any("implement" in ((n.get("assessment") or "").lower()) for n in notes)
+    q_extra = " implementation impl source" if impl_cue else ""
+    query = (bug + " " + " ".join(hints[:6]) + q_extra).strip()
     try:
         hits = r.retrieve(query) or []
     except Exception:
         hits = []
+    if not hits:
+        return {"relocalize_count": count}
+    # Drop the rejected file, then (when impl is implicated) float implementation-
+    # shaped paths above interface decls so `commit` re-localizes onto the code that
+    # runs, not the .aidl it already rejected. Note: guess_layer tags impl .cpp under
+    # aidl/impl as "aidl" too, so layer alone can't separate them — use path shape.
+    # Soft, stable re-rank: nothing is invented, hits are only reordered/filtered.
+    excl_stem = (dx.get("file", "") or "").split("/")[-1].lower()
+
+    def _is_impl(p: str) -> bool:
+        pl = (p or "").lower()
+        return pl.endswith((".cpp", ".cc", ".h")) or "/impl/" in pl or "fake_impl" in pl
+
+    hits = [h for h in hits
+            if (h.get("path") or "").split("/")[-1].lower() != excl_stem]
+    if impl_cue:
+        hits.sort(key=lambda h: not _is_impl(h.get("path") or ""))
     if not hits:
         return {"relocalize_count": count}
     lines = []
@@ -264,7 +296,9 @@ def should_relocalize(state: AgentState) -> Literal["relocalize", "finalize"]:
     if not c.get("reject_committed"):
         return "finalize"
     dx = state.get("diagnosis") or {}
-    if _relocalize_hints(state.get("specialist_notes") or [], exclude_file=dx.get("file", "")):
+    anchors = list(dx.get("property_ids") or []) + list(dx.get("symbols") or [])
+    if _relocalize_hints(state.get("specialist_notes") or [],
+                         exclude_file=dx.get("file", ""), extra_anchors=anchors):
         return "relocalize"
     return "finalize"
 
@@ -705,11 +739,25 @@ def finalize(state: AgentState) -> Dict[str, Any]:
     test (bound to the committed symbols); the patch comes from the grounded
     loop on the committed file. All oracles still run as a double-check.
     """
+    if state.get("workflow") == "requirement":
+        return _finalize_requirement(state)
     dx = state.get("diagnosis") or {}
     r = get_retriever()
     needs_review = bool(state.get("needs_human_review"))
     consensus = state.get("specialist_consensus") or {}
     if consensus.get("force_human_review"):
+        needs_review = True
+
+    # Owning specialists gave the committed target no weighted support and at least
+    # one rejected it, and the (capped) re-localization never produced a target they
+    # accept — so `reject_committed` is STILL set when we reach finalize. A successful
+    # re-localization would have cleared it on the last specialists pass. Binding a
+    # patch / unit test / rendered root-cause to a target the specialists refuted is
+    # exactly what produced the misleading "N/A — no change" patch and a unit test
+    # that validates the refuted hypothesis. When rejected we localize-and-flag for a
+    # human instead of fabricating a fix against a dead target.
+    rejected = bool(consensus.get("reject_committed"))
+    if rejected:
         needs_review = True
 
     # 1) The committed diagnosis IS the candidate list + root cause (source of truth).
@@ -730,7 +778,7 @@ def finalize(state: AgentState) -> Dict[str, Any]:
             dx = {**dx, "candidates": fb}
             fallback_candidates = True
 
-    text = render_diagnosis(dx)
+    text = render_diagnosis(dx, rejected=rejected)
     if fallback_candidates:
         text += ("\n\n> \u2139 Candidates above are the retriever's top hybrid-RAG "
                  "hits (the LLM committed no grounded file). Localization only — "
@@ -740,30 +788,58 @@ def finalize(state: AgentState) -> Dict[str, Any]:
     )
     text += spec_notes
 
+    if rejected:
+        # The rendered root cause above is the REJECTED committed hypothesis — say so
+        # loudly so it is not read as the answer, and hand the human the leads the
+        # specialists named plus the retriever's re-localization candidates. No patch
+        # and no unit test are generated against a refuted target (sections 2 & 4 are
+        # skipped below).
+        rc = dx.get("root_cause") or "(none)"
+        hints = _relocalize_hints(state.get("specialist_notes") or [],
+                                  exclude_file=dx.get("file", ""))
+        text += ("\n\n## ⚠ Localization unresolved — committed target rejected\n"
+                 f"Owning specialists gave no weighted support to `{dx.get('file')}` "
+                 "and re-localization did not converge on a target they accept, so no "
+                 "patch or unit test was generated.\n"
+                 f"- Rejected root-cause hypothesis: {rc}\n"
+                 f"- Specialist leads to investigate next: "
+                 f"{', '.join(hints[:8]) or '(none named)'}\n")
+        leads = []
+        for h in (state.get("retrieved") or [])[:8]:
+            p = h.get("path")
+            if p:
+                leads.append(f"  - [{h.get('layer') or guess_layer(p)}] {p}")
+        if leads:
+            text += "- Retriever re-localization candidates:\n" + "\n".join(leads) + "\n"
+
     # 2) Unit test — LLM writes REAL compilable test code, bound to committed facts
     #    and the target file's actual API (fed below so it doesn't invent methods).
-    ut_file = dx.get("file") or ""
-    ut_excerpt = ""
-    if r is not None and ut_file:
+    #    Skipped on a rejected target: a test bound to the refuted symbols only
+    #    validates the wrong hypothesis (e.g. asserting PERF_VEHICLE_SPEED == FLOAT
+    #    when the AIDL already declares FLOAT).
+    if not rejected:
+        ut_file = dx.get("file") or ""
+        ut_excerpt = ""
+        if r is not None and ut_file:
+            try:
+                ut_excerpt = r.read_file(ut_file, max_chars=4000)
+            except Exception:
+                ut_excerpt = ""
+        facts = (f"Committed diagnosis:\n- file: {dx.get('file')}\n"
+                 f"- layer: {dx.get('layer')}\n"
+                 f"- symbols: {', '.join(dx.get('symbols') or []) or '(none)'}\n"
+                 f"- property_ids: {', '.join(dx.get('property_ids') or []) or '(none)'}\n"
+                 f"- root_cause: {dx.get('root_cause')}\n\n"
+                 f"Target file excerpt (reference REAL API from here — do not invent):\n"
+                 f"{ut_excerpt or '(not available)'}")
         try:
-            ut_excerpt = r.read_file(ut_file, max_chars=4000)
+            resp = llm.invoke([SystemMessage(content=SYSTEM + spec_notes),
+                               HumanMessage(content=facts),
+                               HumanMessage(content=_UT_PROMPT)])
+            ut_text = resp.content if isinstance(resp.content, str) else str(resp.content)
         except Exception:
-            ut_excerpt = ""
-    facts = (f"Committed diagnosis:\n- file: {dx.get('file')}\n"
-             f"- layer: {dx.get('layer')}\n"
-             f"- symbols: {', '.join(dx.get('symbols') or []) or '(none)'}\n"
-             f"- property_ids: {', '.join(dx.get('property_ids') or []) or '(none)'}\n"
-             f"- root_cause: {dx.get('root_cause')}\n\n"
-             f"Target file excerpt (reference REAL API from here — do not invent):\n"
-             f"{ut_excerpt or '(not available)'}")
-    try:
-        resp = llm.invoke([SystemMessage(content=SYSTEM + spec_notes),
-                           HumanMessage(content=facts),
-                           HumanMessage(content=_UT_PROMPT)])
-        ut_text = resp.content if isinstance(resp.content, str) else str(resp.content)
-    except Exception:
-        ut_text = "## Unit test\n_(unit test generation unavailable)_"
-    text += "\n\n" + ut_text
+            ut_text = "## Unit test\n_(unit test generation unavailable)_"
+        text += "\n\n" + ut_text
 
     # 3) Safety-critical layers ALWAYS require a human — from the committed layers.
     committed_layers = {dx.get("layer", "")} | {c.get("layer", "")
@@ -782,12 +858,20 @@ def finalize(state: AgentState) -> Dict[str, Any]:
     if any(k in committed_text for k in ("selinux", "sepolicy", "power")):
         needs_review = True
 
-    # 4) Patch — generated ONLY against the committed, grounded file.
+    # 4) Patch — generated ONLY against the committed, grounded file, and ONLY when
+    #    the specialists did not reject that file. On a rejected target the file is
+    #    (correctly) fine, so the loop returns "no change" — but printing "N/A — no
+    #    minimal change warranted" reads as "the file is clean and this is the answer",
+    #    hiding that the target was refuted. Say the real reason instead.
     grounded_marker = None
     grounded_source = ""
     grounded_patch = ""
     target = dx.get("file", "")
-    if r is not None and dx.get("committed") and target:
+    if rejected:
+        text += ("\n\n## Patch\nNo patch generated — the committed target was rejected "
+                 "by the owning specialists (see 'Localization unresolved' above). "
+                 "Re-localize to an accepted target before patching.")
+    elif r is not None and dx.get("committed") and target:
         if getattr(r, "source_present", True):
             budget = 24000
             # Read the whole file (big cap), then window on the committed symbols
@@ -795,11 +879,26 @@ def finalize(state: AgentState) -> Dict[str, Any]:
             # past the first `budget` chars — instead of a blind first-N slice.
             full = r.read_file(target, max_chars=400000, add_marker=False)
             if not full.startswith("[error") and not full.startswith("[refused"):
-                window, windowed = symbol_window(full, dx.get("symbols") or [], budget)
+                # Prefer a COMPLETE enclosing AST node over a char-truncated window:
+                # a whole function/class is syntactically self-contained, so the patch
+                # oracle can actually run parse_ok on it (truncated=False) instead of
+                # skipping the check as it must for a mid-file char cut. Fall back to
+                # the char window when no node fits (big node, .aidl/no grammar, etc.).
+                node = None
+                for _sym in (dx.get("symbols") or []) + (dx.get("property_ids") or []):
+                    node = read_enclosing_node(target, _sym, text=full, max_chars=budget)
+                    if node:
+                        break
+                if node:
+                    window, windowed = node["code"], False
+                    region = f"{target}:{node['start_line']}-{node['end_line']}"
+                else:
+                    window, windowed = symbol_window(full, dx.get("symbols") or [], budget)
+                    region = target
                 patch_text, syntax_note = _grounded_patch_loop(
                     window, target, state.get("bug_report", ""),
                     dx.get("root_cause", ""), truncated=windowed)
-                marker = "\n\n## Patch (grounded in full file: " + target + ")\n"
+                marker = "\n\n## Patch (grounded in " + region + ")\n"
                 if "@@" in patch_text:
                     text += marker + patch_text
                     grounded_marker = marker
@@ -860,3 +959,350 @@ def finalize(state: AgentState) -> Dict[str, Any]:
 
 # Multi-agent per-layer specialists (built once, reuse shared llm + active retriever)
 specialists = make_specialists_node(llm, get_retriever)
+
+
+# =====================================================================================
+# requirement -> code workflow (multi-workflow). Bug path above is untouched.
+# Deterministic backbone: route_workflow, decompose, consistency_check, regenerate.
+# LLM-backed (grounded, fail-safe): extract_spec, generate_subtask.
+# =====================================================================================
+import json  # noqa: E402
+
+MAX_REGEN = int(CFG.get("agent", {}).get("regen_cap", 1))
+_SAFETY_LAYERS = {"aidl", "vhal", "carservice", "selinux", "binder"}
+
+_REQ_HINTS = re.compile(
+    r"\bas an?\b.{0,40}\bi want\b|acceptance criteria|user stor|epic\b|"
+    r"the system (shall|should|must)|\bshall\b|high[- ]level requirement|\bHLR\b",
+    re.I | re.S)
+_BUG_HINTS = re.compile(
+    r"logcat|stack ?trace|back ?trace|\bNPE\b|crash|\bANR\b|exception|fatal|"
+    r"reproduc|reads?\s+0|returns?\s+0|shows?\s+0", re.I)
+
+
+def _json_obj(text: str) -> dict:
+    """Best-effort JSON object from an LLM reply (strips fences, takes first {...})."""
+    if not text:
+        return {}
+    t = re.sub(r"```(?:json)?|```", "", text).strip()
+    m = re.search(r"\{.*\}", t, re.S)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {}
+
+
+# Fixed VHAL decomposition template. The skeleton is CODE, not a prompt: the LLM only
+# fills each artifact body, so the plan stays deterministic and reviewable. `applies`
+# gates optional layers off the spec. Targets are AAOS defaults; a real vendor HAL or
+# a retriever hit can override them.
+_VHAL_TEMPLATE = [
+    dict(id="vss", layer="vss", deps=[],
+         target="(VSS signal lookup)",
+         intent="Confirm the VSS signal backing {feature}",
+         applies=lambda s: bool(s.get("vss_signal"))),
+    dict(id="aidl", layer="aidl", deps=["vss"],
+         target="hardware/interfaces/automotive/vehicle/aidl_property/android/hardware/"
+                "automotive/vehicle/VehicleProperty.aidl",
+         intent="Declare {property_id} composed as area {area} | type {type} | SYSTEM",
+         applies=lambda s: True),
+    dict(id="config", layer="config", deps=["aidl"],
+         target="hardware/interfaces/automotive/vehicle/aidl/impl/default_config/config/"
+                "DefaultProperties.json",
+         intent="Seed defaultValue for {property_id}; include sample rates if CONTINUOUS",
+         applies=lambda s: True),
+    dict(id="impl", layer="vhal", deps=["aidl", "config"],
+         target="hardware/interfaces/automotive/vehicle/aidl/impl/fake_impl/hardware/src/"
+                "FakeVehicleHardware.cpp",
+         intent="Register and populate/update {property_id} of type {type}",
+         applies=lambda s: True),
+    dict(id="carservice", layer="carservice", deps=["impl"],
+         target="packages/services/Car/service/src/com/android/car/CarPropertyService.java",
+         intent="Forward {property_id} to clients with permission mapping",
+         applies=lambda s: bool(s.get("user_facing"))),
+    # binder: only when a NEW vendor service is introduced; an added property on an
+    # existing service rides the already-registered binder interface (no change).
+    dict(id="binder", layer="binder", deps=["impl"],
+         target="hardware/interfaces/automotive/vehicle/aidl/impl/vhal/src/VehicleService.cpp",
+         intent="Register vendor service {service_name} with ServiceManager; AIDL Bn/Bp for {property_id}",
+         applies=lambda s: bool(s.get("new_service"))),
+    # selinux: only when a new type/service label or vendor-writable path is added;
+    # a property on the existing hal_vehicle domain needs no new .te.
+    dict(id="selinux", layer="selinux", deps=["impl"],
+         target="device/generic/car/common/sepolicy/vendor/hal_vehicle_vss.te",
+         intent="Allow-only .te fragment scoped to {service_name}; grant property/data_file access for {property_id}",
+         applies=lambda s: bool(s.get("needs_sepolicy") or s.get("new_service"))),
+    # hmi: only for a user-facing feature that an app surfaces.
+    dict(id="hmi", layer="hmi", deps=["carservice"],
+         target="packages/apps/Car/CarSettings/src/com/android/car/settings/vss/"
+                "{property_id}Client.java",
+         intent="CarPropertyManager client subscribing/reading {property_id} for the UI",
+         applies=lambda s: bool(s.get("user_facing"))),
+    dict(id="test", layer="test", deps=["impl"],
+         target="hardware/interfaces/automotive/vehicle/aidl_property/tests/"
+                "VehiclePropertyTest.java",
+         intent="Fail-to-pass test asserting {property_id} type/behaviour",
+         applies=lambda s: True),
+]
+
+_XREF_KEYS = ("property_id", "type", "area", "change_mode", "vss_signal",
+              "service_name", "permission")
+
+
+def route_workflow(state: AgentState) -> Dict[str, Any]:
+    """Classify the input: requirement (story/epic/HLR) vs bug (symptom/logcat).
+    Deterministic heuristic; an explicit `requirement` field wins. No LLM needed."""
+    req = (state.get("requirement") or "").strip()
+    bug = (state.get("bug_report") or "").strip()
+    text = req or bug
+    if req and not bug:
+        wf = "requirement"
+    else:
+        req_hit = bool(_REQ_HINTS.search(text))
+        bug_hit = bool(_BUG_HINTS.search(text))
+        wf = "requirement" if (req_hit and not bug_hit) else "bug"
+    return {"workflow": wf}
+
+
+def pick_workflow(state: AgentState) -> Literal["bug", "requirement"]:
+    return "requirement" if state.get("workflow") == "requirement" else "bug"
+
+
+def extract_spec(state: AgentState) -> Dict[str, Any]:
+    """Requirement prose -> structured spec (the xref anchors), grounded on the
+    retriever so property/type/VSS names are real. Fail-safe: on any error it emits
+    an empty spec and flags human review rather than crashing the graph."""
+    req = (state.get("requirement") or state.get("bug_report") or "").strip()
+    r = get_retriever()
+    ctx = ""
+    try:
+        if r is not None:
+            hits = r.retrieve(req)[:5] or []
+            ctx = "\n".join(f"- {h.get('path')}: {(h.get('content') or '')[:200]}"
+                            for h in hits)
+    except Exception:
+        ctx = ""
+    prompt = (
+        "Extract a VHAL property spec from the requirement. Return ONLY JSON with keys: "
+        "feature, property_id (UPPER_SNAKE), type (FLOAT|INT32|INT64|BOOLEAN|STRING), "
+        "area (GLOBAL|WHEEL|DOOR|SEAT|WINDOW|MIRROR), "
+        "change_mode (STATIC|ON_CHANGE|CONTINUOUS), vss_signal (dotted or null), "
+        "user_facing (bool), permission (string or null), "
+        "service_name (vendor VHAL service e.g. vendor.vss.adas, or null), "
+        "new_service (bool: true only if a NEW vendor service must be registered), "
+        "needs_sepolicy (bool: true only if a new SELinux label/type or vendor-writable "
+        "path is introduced).\n\n"
+        f"Requirement:\n{req}\n\nGrounding (real files):\n{ctx}")
+    spec: dict = {}
+    try:
+        resp = llm.invoke([SystemMessage(content=SYSTEM), HumanMessage(content=prompt)])
+        spec = _json_obj(resp.content if isinstance(resp.content, str) else str(resp.content))
+    except Exception:
+        spec = {}
+    needs_review = not bool(spec.get("property_id") and spec.get("type"))
+    return {"spec": spec, "needs_human_review": needs_review or bool(state.get("needs_human_review"))}
+
+
+def decompose(state: AgentState) -> Dict[str, Any]:
+    """Instantiate the fixed VHAL template from the spec -> ordered subtasks. Every
+    subtask carries a COPY of the spec's xref anchors, so consistency is later a
+    structural equality, not an LLM opinion. Fully deterministic."""
+    spec = state.get("spec") or {}
+    xref = {k: spec.get(k) for k in _XREF_KEYS}
+    subtasks = []
+    fmt = {k: spec.get(k, "?") for k in
+           ("feature", "property_id", "type", "area", "service_name", "permission")}
+    for t in _VHAL_TEMPLATE:
+        try:
+            if not t["applies"](spec):
+                continue
+        except Exception:
+            continue
+        try:
+            tgt = t["target"].format(**fmt)   # some targets embed {property_id}
+        except Exception:
+            tgt = t["target"]
+        subtasks.append({
+            "id": t["id"], "layer": t["layer"], "target": tgt,
+            "intent": t["intent"].format(**fmt),
+            "depends_on": list(t["deps"]), "xref": dict(xref),
+            "artifact": "", "status": "pending",
+        })
+    return {"subtasks": subtasks, "regen_count": int(state.get("regen_count", 0))}
+
+
+def _settled(subtasks: list, ids: list) -> bool:
+    by = {s["id"]: s for s in subtasks}
+    return all(by.get(i, {}).get("status") in ("done", "failed") for i in ids)
+
+
+def generate_subtask(state: AgentState) -> Dict[str, Any]:
+    """Generate ONE pending subtask whose deps are settled, grounded on the retriever
+    + its xref + a real exemplar (read_enclosing_node). Marks done/failed and returns
+    the FULL subtask list (no reducer). Sequential; a fan-out swaps only this node."""
+    subtasks = [dict(s) for s in (state.get("subtasks") or [])]
+    nxt = next((s for s in subtasks
+                if s["status"] == "pending" and _settled(subtasks, s["depends_on"])), None)
+    if nxt is None:
+        return {"subtasks": subtasks}
+
+    # VSS lookup is a confirmation step, not code generation.
+    if nxt["layer"] == "vss":
+        nxt["artifact"] = str(nxt["xref"].get("vss_signal") or "(none)")
+        nxt["status"] = "done"
+        return {"subtasks": subtasks}
+
+    r = get_retriever()
+    ctx, exemplar = "", ""
+    try:
+        if r is not None:
+            pid = nxt["xref"].get("property_id") or ""
+            hits = (r.retrieve(f"{pid} {nxt['layer']}") or [])[:4]
+            ctx = "\n".join(f"- {h.get('path')}: {(h.get('content') or '')[:180]}" for h in hits)
+            if pid:
+                node = read_enclosing_node(nxt["target"], pid) or None
+                if node:
+                    exemplar = node["code"][:1500]
+    except Exception:
+        ctx, exemplar = "", ""
+
+    prompt = (
+        f"Produce the code change for this subtask. Target: {nxt['target']}\n"
+        f"Intent: {nxt['intent']}\n"
+        f"Shared anchors (MUST match exactly): {json.dumps(nxt['xref'])}\n"
+        f"Output a unified diff if editing an existing file, else the full new file body. "
+        f"No prose.\n\nGrounding:\n{ctx}\n\nExemplar of this layer:\n{exemplar}")
+    try:
+        resp = llm.invoke([SystemMessage(content=SYSTEM), HumanMessage(content=prompt)])
+        art = resp.content if isinstance(resp.content, str) else str(resp.content)
+        nxt["artifact"] = art.strip()
+        nxt["status"] = "done" if nxt["artifact"] else "failed"
+    except Exception:
+        nxt["status"] = "failed"
+    return {"subtasks": subtasks}
+
+
+def pick_gen(state: AgentState) -> Literal["generate", "check"]:
+    subtasks = state.get("subtasks") or []
+    has_pending = any(s["status"] == "pending" and _settled(subtasks, s["depends_on"])
+                      for s in subtasks)
+    return "generate" if has_pending else "check"
+
+
+def consistency_check(state: AgentState) -> Dict[str, Any]:
+    """Structural cross-layer verifier (deterministic). Checks the generated artifacts
+    agree on the shared anchors — the 'reads 0' bug class (type/seed mismatch across
+    layers) caught before it ships. Records offending subtask ids so regenerate can
+    reset exactly those. (An LLM specialist verifier can be layered on top later.)"""
+    spec = state.get("spec") or {}
+    pid = (spec.get("property_id") or "").strip()
+    ctype = (spec.get("type") or "").strip().upper()
+    cmode = (spec.get("change_mode") or "").strip().upper()
+    svc = (spec.get("service_name") or "").strip()
+    conflicts: list = []
+    done = [s for s in (state.get("subtasks") or []) if s["status"] == "done" and s["artifact"]]
+
+    def _mentions(txt, tok):
+        return bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(tok) + r"(?![A-Za-z0-9_])", txt))
+
+    for s in done:
+        art = s["artifact"]
+        # property-id carriers: the property name must appear verbatim
+        if s["layer"] in ("aidl", "config", "vhal", "carservice", "hmi") and pid and \
+                not _mentions(art, pid):
+            conflicts.append({"id": s["id"], "reason": f"{s['id']} artifact omits {pid}"})
+        # service-label carriers: the vendor service name must appear (selinux/binder)
+        if s["layer"] in ("selinux", "binder") and svc and not _mentions(art, svc):
+            conflicts.append({"id": s["id"], "reason": f"{s['id']} artifact omits service {svc}"})
+        # a conflicting VehiclePropertyType token in aidl/impl (e.g. INT32 vs declared FLOAT)
+        if s["layer"] in ("aidl", "vhal") and ctype:
+            others = {"FLOAT", "INT32", "INT64", "BOOLEAN", "STRING"} - {ctype}
+            hit = [o for o in others
+                   if re.search(r"VehiclePropertyType\s*[:.]{1,2}\s*" + o, art)]
+            if hit:
+                conflicts.append({"id": s["id"],
+                                  "reason": f"{s['id']} uses type {hit[0]}, spec says {ctype}"})
+    # CONTINUOUS properties must seed sample rates in config
+    if cmode == "CONTINUOUS":
+        cfg = next((s for s in done if s["layer"] == "config"), None)
+        if cfg and "ampleRate" not in cfg["artifact"]:
+            conflicts.append({"id": "config", "reason": "CONTINUOUS but no sample rate seeded"})
+
+    return {"req_consensus": {"consistent": not conflicts, "conflicts": conflicts}}
+
+
+def after_check(state: AgentState) -> Literal["regenerate", "assemble"]:
+    rc = state.get("req_consensus") or {}
+    if rc.get("conflicts") and int(state.get("regen_count", 0)) < MAX_REGEN:
+        return "regenerate"
+    return "assemble"
+
+
+def regenerate(state: AgentState) -> Dict[str, Any]:
+    """Reset exactly the conflicting subtasks to pending, feed the reason back via
+    intent, bump the cap. Analogous to relocalize for the bug path."""
+    conflicts = (state.get("req_consensus") or {}).get("conflicts") or []
+    bad = {c["id"]: c["reason"] for c in conflicts}
+    subtasks = []
+    for s in (state.get("subtasks") or []):
+        s = dict(s)
+        if s["id"] in bad:
+            s["status"] = "pending"
+            s["intent"] = f"{s['intent']}  [FIX: {bad[s['id']]}]"
+            s["artifact"] = ""
+        subtasks.append(s)
+    return {"subtasks": subtasks, "regen_count": int(state.get("regen_count", 0)) + 1}
+
+
+def assemble(state: AgentState) -> Dict[str, Any]:
+    """Collect done artifacts into a change-set + traceability, hand off to finalize."""
+    done = [s for s in (state.get("subtasks") or []) if s["status"] == "done" and s["artifact"]]
+    return {"candidate_files": [s["target"] for s in done if s["layer"] != "vss"],
+            "status": "assembled"}
+
+
+def _finalize_requirement(state: AgentState) -> Dict[str, Any]:
+    """Render the requirement->code change-set + traceability, with the same
+    safety-critical human-review gate the bug path uses."""
+    spec = state.get("spec") or {}
+    subtasks = state.get("subtasks") or []
+    rc = state.get("req_consensus") or {}
+    feature = spec.get("feature") or spec.get("property_id") or "(requirement)"
+
+    lines = [f"# Requirement → code: {feature}", ""]
+    lines.append("## Spec")
+    lines.append("```json\n" + json.dumps({k: spec.get(k) for k in
+                 ("property_id", "type", "area", "change_mode", "vss_signal", "user_facing")},
+                 indent=2) + "\n```")
+    if not rc.get("consistent", True):
+        lines.append("\n## ⚠ Cross-layer conflicts (regenerate did not fully resolve)")
+        for c in rc.get("conflicts", []):
+            lines.append(f"- **{c['id']}**: {c['reason']}")
+    lines.append("\n## Change-set (traceability: requirement → artifact)")
+    touched_safety = False
+    for s in subtasks:
+        state_tag = s["status"].upper()
+        if s["layer"] in _SAFETY_LAYERS and s["status"] == "done":
+            touched_safety = True
+        lines.append(f"\n### [{s['layer']}] {s['target']}  ({state_tag})")
+        if s["status"] == "done" and s["artifact"]:
+            lines.append("```\n" + s["artifact"][:6000] + "\n```")
+        elif s["layer"] == "vss":
+            lines.append(f"VSS signal: `{s['artifact']}`")
+        else:
+            lines.append("_(not generated)_")
+
+    needs_review = bool(state.get("needs_human_review")) or touched_safety \
+        or not rc.get("consistent", True) \
+        or any(s["status"] == "failed" for s in subtasks)
+    if touched_safety:
+        lines.append("\n> ⚠ Human review required: touches safety-critical layer(s).")
+
+    return {
+        "messages": [AIMessage(content="\n".join(lines))],
+        "status": "completed",
+        "needs_human_review": needs_review,
+        "candidate_files": [s["target"] for s in subtasks if s["layer"] != "vss"],
+    }
