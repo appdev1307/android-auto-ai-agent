@@ -209,9 +209,20 @@ def is_ancestor(proj_dir: Path, sha: str) -> bool | None:
     """Is the fix already in the indexed checkout? None if not a git checkout."""
     if not (proj_dir / ".git").exists():
         return None
+    # The fix commit may be absent from the indexed checkout (e.g. a --depth 1
+    # clone): that is "unknown", not "not fixed".
+    known = subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                           cwd=proj_dir, capture_output=True, text=True)
+    if known.returncode != 0:
+        shallow = subprocess.run(["git", "rev-parse", "--is-shallow-repository"],
+                                 cwd=proj_dir, capture_output=True, text=True)
+        # full history without the commit => the fix is not in the index
+        return False if shallow.stdout.strip() == "false" else None
     r = subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"],
                        cwd=proj_dir, capture_output=True, text=True)
-    return r.returncode == 0
+    if r.returncode in (0, 1):
+        return r.returncode == 0
+    return None
 
 
 # ── file classification (mirrors retrieval.chunker.should_index, base mode) ──
