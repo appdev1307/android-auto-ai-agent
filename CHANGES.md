@@ -699,7 +699,7 @@ P1 (ran, but wrong results):
 - `scripts/start_vllm.sh` / `data/config.yaml` — default model Qwen2.5-Coder-32B-Instruct,
   `MAX_LEN=32768`, `QUANT=none` (prompt ~10k tokens + `max_tokens` 8192 exceeded 8192;
   `awq` on non-AWQ weights failed).
-- `AAOS_Agent_Colab.ipynb` — `OLLAMA_CONTEXT_LENGTH=32768`, `OLLAMA_NUM_PARALLEL=1`
+- `AAOS_Agent_Colab.ipynb` — `OLLAMA_CONTEXT_LENGTH=32768`, `OLLAMA_NUM_PARALLEL=1` (4 since Update 31)
   (default context silently truncated the prompt).
 
 P2:
@@ -712,3 +712,34 @@ New:
 - `eval/mine_labels.py` — gold labels from AOSP open-source fix commits (see README
   *Mining gold labels*). `fixed_in_index` is null (unknown) when the indexed checkout is
   shallow and lacks the fix commit.
+
+# Update 30 — Colab notebook aligned with Update 29
+
+`AAOS_Agent_Colab.ipynb`:
+- Step 1: resets `data/config.yaml` before `git pull` (step 2 edits it, so a later pull
+  refused to update); prints the checked-out commit. Removed the second `git pull` cell.
+- Step 2: also sets `OPENAI_API_BASE` (env now overrides config); prints `max_tokens`/stores.
+- Step 3: `AOSP_BRANCH` / `AOSP_VERSION` variables; clones are `--depth 1 --no-tags
+  --single-branch`, print the SHA, and show the git error when skipped. Notes that `main`
+  is not the `android-15.0.0_r1` release despite the `aosp15` store name.
+- Index cell: rebuilds with `--reset` when no index, `REBUILD=True`, a pre-Update-29
+  manifest (no `git_shas`), or a different `SCOPE`; otherwise reuses it.
+- Step 4: `OLLAMA_CONTEXT_LENGTH=32768`, `OLLAMA_NUM_PARALLEL=1`; new preflight + warm-up
+  cell (config, index, AOSP tree, one tiny chat call, `ollama ps`).
+- Step 5: agent cells drop `--customer base` (default tenant resolves `_base`), use
+  `{AOSP}` / `{AOSP_VERSION}`; markdown describes relocalize and expected call count.
+- Step 6 (new): `eval/mine_labels.py` + `eval/run_eval.py`, outputs to Drive, with the
+  caveat that a `--depth 1` index of `main` already contains most mined fixes.
+- Outputs cleared.
+
+# Update 31 — Colab model aligned with code-codegen-aosp-llm-based
+
+- Colab stays on **Ollama `qwen2.5-coder:32b`**, the same model and context (`num_ctx`
+  32768) as `llm_client.py` in `code-codegen-aosp-llm-based`, so both thesis pipelines run
+  on identical weights.
+- `OLLAMA_NUM_PARALLEL=4` as in that repo (fits 80 GB: ~20 GB model + 4 × ~9 GB KV at 32k);
+  `OLLAMA_CONTEXT_LENGTH=32768` stays, because the agent uses Ollama's OpenAI-compatible
+  `/v1`, which does not accept a per-request `num_ctx`.
+- Step 2 no longer exports `OPENAI_API_BASE`; it removes any stale value so
+  `data/config.yaml` is the single source of the endpoint.
+

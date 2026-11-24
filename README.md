@@ -260,10 +260,15 @@ For development you don't need a server or the full AOSP tree. Index the automot
 
 Use the notebook `AAOS_Agent_Colab.ipynb`. It:
 1. mounts Drive (index persists there),
-2. shallow-clones automotive-relevant projects (not full AOSP),
-3. indexes that subset to `stores_root` on Drive (skips if already built),
-4. starts **Ollama** with a coding model (e.g. `qwen2.5-coder:32b` or a lighter 14B)
-   and runs the agent.
+2. shallow-clones automotive-relevant projects (not full AOSP) — tag-less, single branch
+   (`AOSP_BRANCH`, default `main`; the store is still named `aosp15`),
+3. indexes that subset to `stores_root` on Drive — reused when present, rebuilt with
+   `--reset` when missing, built before Update 29 (no `git_shas`), or `SCOPE` changed,
+4. starts **Ollama** with a coding model (e.g. `qwen2.5-coder:32b` or a lighter 14B) at
+   `OLLAMA_CONTEXT_LENGTH=32768`, warms it up with a preflight check, and runs the agent
+   (base-only, no `--customer` needed),
+5. optionally mines gold labels (`eval/mine_labels.py`) and runs `eval/run_eval.py`,
+   writing labels/results to Drive.
 
 **Why Ollama on Colab:** vLLM often fails on Colab due to Python/CUDA/torch/flashinfer
 wheel mismatches and long source builds. Ollama ships a prebuilt binary and still exposes
