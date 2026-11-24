@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Any, Literal
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.prebuilt import ToolNode
 
 from agent.state import AgentState
@@ -18,7 +18,7 @@ from retrieval.store import Tenant
 from retrieval.chunker import (apply_unified_diff, parse_ok, grammar_missing, guess_layer,
                                clang_format_check, symbol_window, read_enclosing_node)
 from agent.specialists import make_specialists_node, format_specialist_notes
-from agent.diagnosis import (Diagnosis, collect_evidence, commit_diagnosis_record,
+from agent.diagnosis import (collect_evidence, commit_diagnosis_record,
                              render_diagnosis)
 
 
@@ -86,7 +86,9 @@ def load_skills() -> str:
 
 CFG = load_config()
 MODEL = CFG.get("model", {})
-API_BASE = MODEL.get("api_base") or os.environ.get("OPENAI_API_BASE")
+# Env wins over config so `export OPENAI_API_BASE=...` (README step 4) or a Groq
+# endpoint can be switched without editing data/config.yaml.
+API_BASE = os.environ.get("OPENAI_API_BASE") or MODEL.get("api_base")
 API_KEY = os.environ.get("OPENAI_API_KEY", "dummy")
 
 _kwargs = {
@@ -243,7 +245,7 @@ def relocalize(state: AgentState) -> Dict[str, Any]:
     hints = _relocalize_hints(notes, exclude_file=dx.get("file", ""),
                               extra_anchors=anchors)
     if r is None or not hints:
-        return {"relocalize_count": count}
+        return {"relocalize_count": count, "status": "relocalize_empty"}
     # If a specialist says the fault is in the IMPLEMENTATION (interface file
     # rejected as the wrong layer), bias both the query and the ranking toward impl
     # source instead of another interface declaration.
@@ -255,7 +257,7 @@ def relocalize(state: AgentState) -> Dict[str, Any]:
     except Exception:
         hits = []
     if not hits:
-        return {"relocalize_count": count}
+        return {"relocalize_count": count, "status": "relocalize_empty"}
     # Drop the rejected file, then (when impl is implicated) float implementation-
     # shaped paths above interface decls so `commit` re-localizes onto the code that
     # runs, not the .aidl it already rejected. Note: guess_layer tags impl .cpp under
@@ -272,7 +274,7 @@ def relocalize(state: AgentState) -> Dict[str, Any]:
     if impl_cue:
         hits.sort(key=lambda h: not _is_impl(h.get("path") or ""))
     if not hits:
-        return {"relocalize_count": count}
+        return {"relocalize_count": count, "status": "relocalize_empty"}
     lines = []
     for i, h in enumerate(hits[:8], 1):
         snippet = (h.get("content") or "")[:300].replace("\n", " ")
@@ -284,8 +286,16 @@ def relocalize(state: AgentState) -> Dict[str, Any]:
            "the correct target from THESE exact paths and re-commit:\n"
            + "\n".join(lines))
     return {"retrieved": hits, "relocalize_count": count,
+            "status": "relocalized",
+            # cleared so the re-commit + specialist pass decide review afresh
             "needs_human_review": False,
             "messages": [HumanMessage(content=msg)]}
+
+
+def after_relocalize(state: AgentState) -> Literal["commit", "finalize"]:
+    """Re-commit only when relocalize produced NEW candidates; otherwise another
+    commit + specialist round would just re-judge the same rejected target."""
+    return "commit" if state.get("status") == "relocalized" else "finalize"
 
 
 def should_relocalize(state: AgentState) -> Literal["relocalize", "finalize"]:
@@ -630,8 +640,22 @@ def ut_consistency(source_text: str, patch_text: str, ut_text: str) -> list[str]
 PATCH_MAX_TRIES = int(CFG.get("agent", {}).get("patch_max_tries", 2))
 
 
+def _offset_hunks(patch_text: str, offset: int) -> str:
+    """Shift `@@ -a,b +c,d @@` by `offset` lines so a diff generated against a
+    region (one AST node / symbol window) carries real file line numbers."""
+    if offset <= 0:
+        return patch_text
+
+    def _sh(m):
+        a, b, c, d, rest = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        out = f"@@ -{int(a) + offset}" + (f",{b}" if b is not None else "")
+        out += f" +{int(c) + offset}" + (f",{d}" if d is not None else "")
+        return out + " @@" + rest
+    return re.sub(r"(?m)^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$", _sh, patch_text)
+
+
 def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
-                         truncated: bool = False) -> tuple[str, str]:
+                         truncated: bool = False, fragment: bool = False) -> tuple[str, str]:
     """Generate a unified diff, apply it in-memory to the real file, parse-check
     the result with tree-sitter, and on any syntax/apply error feed the concrete
     problem back and regenerate (up to patch_max_tries). This is the C4
@@ -674,9 +698,8 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
         if truncated:
             return patch_text, ("Large file: patch was generated against the "
                                 "symbol-anchored region (not the whole file), so syntax "
-                                "wasn't fully verified and hunk offsets are region-relative "
-                                "— apply with context matching and verify on a real build.")
-        ok, errs = parse_ok(patched, suffix)
+                                "wasn't fully verified — verify on a real build.")
+        ok, errs = parse_ok(patched, suffix, fragment=fragment)
         if ok:
             # parse_ok returns ok=True both for "parsed cleanly" and for "no
             # grammar to parse with". Don't let the latter masquerade as a real
@@ -805,9 +828,10 @@ def finalize(state: AgentState) -> Dict[str, Any]:
                  f"- Specialist leads to investigate next: "
                  f"{', '.join(hints[:8]) or '(none named)'}\n")
         leads = []
+        rejected_file = dx.get("file") or ""
         for h in (state.get("retrieved") or [])[:8]:
             p = h.get("path")
-            if p:
+            if p and p != rejected_file:
                 leads.append(f"  - [{h.get('layer') or guess_layer(p)}] {p}")
         if leads:
             text += "- Retriever re-localization candidates:\n" + "\n".join(leads) + "\n"
@@ -892,12 +916,18 @@ def finalize(state: AgentState) -> Dict[str, Any]:
                 if node:
                     window, windowed = node["code"], False
                     region = f"{target}:{node['start_line']}-{node['end_line']}"
+                    offset = node["start_line"] - 1
                 else:
                     window, windowed = symbol_window(full, dx.get("symbols") or [], budget)
                     region = target
+                    pos = full.find(window) if windowed else 0
+                    offset = full[:pos].count("\n") if pos > 0 else 0
                 patch_text, syntax_note = _grounded_patch_loop(
                     window, target, state.get("bug_report", ""),
-                    dx.get("root_cause", ""), truncated=windowed)
+                    dx.get("root_cause", ""), truncated=windowed,
+                    fragment=bool(node))
+                # diff was made against the region -> report real file line numbers
+                patch_text = _offset_hunks(patch_text, offset)
                 marker = "\n\n## Patch (grounded in " + region + ")\n"
                 if "@@" in patch_text:
                     text += marker + patch_text
@@ -1162,7 +1192,8 @@ def generate_subtask(state: AgentState) -> Dict[str, Any]:
             hits = (r.retrieve(f"{pid} {nxt['layer']}") or [])[:4]
             ctx = "\n".join(f"- {h.get('path')}: {(h.get('content') or '')[:180]}" for h in hits)
             if pid:
-                node = read_enclosing_node(nxt["target"], pid) or None
+                node = read_enclosing_node(nxt["target"], pid,
+                                           root=getattr(r, "aosp_root", None)) or None
                 if node:
                     exemplar = node["code"][:1500]
     except Exception:

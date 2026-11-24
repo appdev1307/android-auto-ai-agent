@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, START, END
 from agent.state import AgentState
 from agent.nodes import (init_retriever, seed_retrieval, agent_reason, should_continue,
                          tool_node, commit_diagnosis, finalize, specialists,
-                         relocalize, should_relocalize)
+                         relocalize, should_relocalize, after_relocalize)
 
 
 def build_graph():
@@ -26,6 +26,8 @@ def build_graph():
     # specialists -> re-localize once if they unanimously reject the target, else finalize
     g.add_conditional_edges("specialists", should_relocalize,
                             {"relocalize": "relocalize", "finalize": "finalize"})
-    g.add_edge("relocalize", "commit")       # re-seeded -> re-commit -> specialists (capped)
+    # re-seeded -> re-commit -> specialists (capped); nothing new -> finalize
+    g.add_conditional_edges("relocalize", after_relocalize,
+                            {"commit": "commit", "finalize": "finalize"})
     g.add_edge("finalize", END)
     return g.compile()

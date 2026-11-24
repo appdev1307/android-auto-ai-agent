@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 import re
 import math
-import json
 import pickle
 import subprocess
 from pathlib import Path
@@ -21,9 +20,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 import yaml
 
 from retrieval.chunker import guess_layer
-from retrieval.store import (
-    Tenant, VectorStore, ChromaVectorStore, StoreProvider, StoreManifest,
-)
+from retrieval.store import Tenant, VectorStore, StoreProvider
 
 
 def _sigmoid(x: float) -> float:
@@ -156,9 +153,9 @@ class HybridRetriever:
         k_exact = self.rag.get("top_k_exact", 20)
         k_fuse = self.rank_cfg.get("rrf_pool", 30)  # pool before rerank
 
-        dense = self._vector_search(query, k_dense)
-        bm25 = self._bm25_search(query, k_bm25)
-        exact = self._exact_search(query, k_exact)
+        dense = self._norm_hits(self._vector_search(query, k_dense))
+        bm25 = self._norm_hits(self._bm25_search(query, k_bm25))
+        exact = self._norm_hits(self._exact_search(query, k_exact))
 
         fused = self._rrf_fuse(
             {"dense": dense, "bm25": bm25, "exact": exact},
@@ -181,6 +178,32 @@ class HybridRetriever:
             fused = fused[:top_k]
         return fused
 
+    def _norm_path(self, path: str) -> str:
+        """One canonical spelling per file across ALL channels: relative to the
+        resolved aosp_root when the file lives under it, else unchanged.
+
+        The indexer stores resolved absolute paths while ripgrep echoes the
+        (possibly relative / symlinked) aosp_root it was given, so the same
+        file arrived under two strings and RRF could not fuse it."""
+        if not path:
+            return path
+        try:
+            root = self._root_resolved
+        except AttributeError:
+            root = self._root_resolved = (self.aosp_root.resolve()
+                                          if str(self.aosp_root) != "." else None)
+        if root is None:
+            return path
+        try:
+            return Path(path).resolve().relative_to(root).as_posix()
+        except Exception:
+            return path
+
+    def _norm_hits(self, hits: list[dict]) -> list[dict]:
+        for h in hits:
+            h["path"] = self._norm_path(h.get("path") or "")
+        return hits
+
     def _normalize_base(self, hits: list[dict]) -> list[dict]:
         norm = _minmax([h.get("score", 0.0) for h in hits])
         for h, n in zip(hits, norm):
@@ -194,6 +217,10 @@ class HybridRetriever:
             return []
         emb = self.embedder.encode([query]).tolist()[0]
         hits = self.store.query(emb, k)
+        # A CompositeStore returns base hits THEN customer hits; rank by
+        # similarity (same embed model => comparable), not by list position,
+        # or every customer hit is ranked below every base hit.
+        hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
         for i, h in enumerate(hits):
             h["source"] = "dense"
             h["rank"] = i + 1
@@ -238,16 +265,17 @@ class HybridRetriever:
         hits = []
         rank = 0
         for rel in roots:
-            base = self.aosp_root / rel
+            base = (self.aosp_root / rel).resolve()
             if not base.exists():
                 continue
             try:
                 cmd = [
                     "rg", "-l", "-i", pattern, str(base),
                     "-g", "!out/", "-g", "!.git/", "-g", "!prebuilts/",
-                    "-g", "*.java", "-g", "*.kt", "-g", "*.cpp", "-g", "*.c",
-                    "-g", "*.h", "-g", "*.aidl", "-g", "*.yaml", "-g", "*.yml",
-                    "-g", "*.json", "-g", "*.xml",
+                    "-g", "*.java", "-g", "*.kt", "-g", "*.kts", "-g", "*.cpp",
+                    "-g", "*.cc", "-g", "*.c", "-g", "*.h", "-g", "*.hpp",
+                    "-g", "*.aidl", "-g", "*.yaml", "-g", "*.yml",
+                    "-g", "*.json", "-g", "*.xml", "-g", "*.vspec",
                 ]
                 out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
                 for line in out.stdout.splitlines():
@@ -271,7 +299,11 @@ class HybridRetriever:
 
     # ------------------------------------------------------------------ RRF + priors + CE
     def _rrf_fuse(self, channels: dict[str, list[dict]], k: int = 60) -> list[dict]:
-        """Reciprocal Rank Fusion: score += 1 / (k + rank)."""
+        """Reciprocal Rank Fusion over FILES: each channel contributes once per
+        file, using that file's best (lowest) rank in the channel.
+
+        Summing every chunk's 1/(k+rank) inflated files that simply have many
+        chunks (large files) over the file that actually matches best."""
         by_path: dict[str, dict] = {}
         for name, hits in channels.items():
             for h in hits:
@@ -290,8 +322,9 @@ class HybridRetriever:
                         "store": h.get("store"),
                         "rrf_parts": {},
                     }
-                by_path[p]["score"] += rrf
-                by_path[p]["rrf_parts"][name] = rrf
+                parts = by_path[p]["rrf_parts"]
+                parts[name] = max(parts.get(name, 0.0), rrf)
+                by_path[p]["score"] = sum(parts.values())
                 # Carry the store tag through fusion so the customer-first prior
                 # can still fire downstream. A path lives in exactly one store,
                 # but it can arrive from several channels (dense+bm25); once any

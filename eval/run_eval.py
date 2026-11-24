@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent.graph import build_graph
 from agent.state import AgentState
 from langchain_core.messages import HumanMessage
-from agent.main import _framed_task
+from agent.main import _framed_task, _load_cfg, _resolve_tenant
 
 
 # ── scoring helpers ──────────────────────────────────────────────
@@ -73,9 +73,11 @@ def run_one(graph, rec: dict, aosp_root, tenant, k: int) -> dict:
         "messages": [HumanMessage(content=_framed_task(rec["bug"], rec.get("logcat")))],
         "bug_report": rec["bug"], "logcat_snippet": rec.get("logcat"),
         "aosp_root": aosp_root, "tenant": tenant, "task_type": "localize_patch",
-        "evidence": [], "candidate_files": [], "root_cause": None,
+        "evidence": [], "diagnosis": {}, "candidate_files": [], "root_cause": None,
         "patches": [], "unit_tests": [], "status": "start",
-        "needs_human_review": True, "iterations": 0,
+        # same seed as agent/main.py: review is raised by real triggers only
+        "needs_human_review": False, "iterations": 0,
+        "relocalize_count": 0, "specialist_notes": [],
     }
     try:
         result = graph.invoke(state, config={"recursion_limit": 25})
@@ -119,8 +121,9 @@ def main():
     ap.add_argument("--out", default="eval/results.json")
     args = ap.parse_args()
 
-    tenant = {"customer": args.customer, "project": args.project,
-              "aosp_version": args.aosp_version} if args.customer else None
+    # Same tenant resolution as agent/main.py: no --customer => config
+    # default_tenant (the shared _base store), not the legacy flat index_dir.
+    tenant = _resolve_tenant(args, _load_cfg())
     recs = [json.loads(l) for l in Path(args.labels).read_text().splitlines() if l.strip()]
     graph = build_graph()
 

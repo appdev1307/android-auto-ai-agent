@@ -14,7 +14,7 @@ Nothing here calls an LLM; it is pure, testable state machinery.
 from __future__ import annotations
 import re
 import json
-from typing import TypedDict, Any, Callable
+from typing import TypedDict, Callable
 
 from langchain_core.messages import ToolMessage, BaseMessage
 
@@ -163,9 +163,13 @@ def commit_diagnosis_record(raw_json: str, evidence: Evidence,
     return dx
 
 
-def render_diagnosis(dx: Diagnosis) -> str:
+def render_diagnosis(dx: Diagnosis, rejected: bool = False) -> str:
     """Deterministic markdown for the committed facts — so finalize RENDERS the
-    diagnosis instead of letting the LLM restate (and drift from) it."""
+    diagnosis instead of letting the LLM restate (and drift from) it.
+
+    rejected=True: the owning specialists refuted the committed target, so the
+    root cause is labelled as a rejected hypothesis rather than the answer.
+    """
     if not dx:
         return ""
     lines = ["## Candidate files (ranked)"]
@@ -175,7 +179,10 @@ def render_diagnosis(dx: Diagnosis) -> str:
     if not dx.get("candidates"):
         lines.append("_(none grounded in evidence)_")
     lines.append("")
-    lines.append("## Root cause")
+    if rejected:
+        lines.append("## Root cause (REJECTED hypothesis — specialists refuted the target)")
+    else:
+        lines.append("## Root cause")
     lines.append(dx.get("root_cause") or "_(not committed)_")
     facts = []
     if dx.get("symbols"):

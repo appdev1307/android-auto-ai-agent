@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -50,6 +50,9 @@ class StoreManifest:
     git_sha: str | None = None
     index_roots: list[str] | None = None   # roots actually indexed (exact-search parity)
     scope: str | None = None               # scope preset used at index time
+    # repo-synced AOSP: the root is not a git repo, each project is. Maps
+    # project path (relative to the AOSP root, "." for a single-repo tree) -> SHA.
+    git_shas: dict[str, str] | None = None
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2)
@@ -61,7 +64,8 @@ class StoreManifest:
         d = json.loads(path.read_text())
         return cls(embed_model=d.get("embed_model", ""),
                    count=d.get("count", 0), git_sha=d.get("git_sha"),
-                   index_roots=d.get("index_roots"), scope=d.get("scope"))
+                   index_roots=d.get("index_roots"), scope=d.get("scope"),
+                   git_shas=d.get("git_shas"))
 
 
 # ── Repository interface ─────────────────────────────────────────
@@ -191,9 +195,16 @@ class CompositeStore:
         return hits
 
     def keyword(self, tokens: list[str], k: int) -> list[dict[str, Any]]:
+        # BM25 scores from different corpora are NOT comparable, and the
+        # retriever ranks by list position — so interleave the layers' own
+        # rankings (customer first) instead of appending customer after base.
+        per_layer = [s.keyword(tokens, k) for s in self.layers]
+        per_layer.sort(key=lambda hs: 0 if hs and hs[0].get("store") == "customer" else 1)
         hits: list[dict] = []
-        for s in self.layers:
-            hits += s.keyword(tokens, k)
+        for i in range(max((len(h) for h in per_layer), default=0)):
+            for hs in per_layer:
+                if i < len(hs):
+                    hits.append(hs[i])
         return hits
 
     def manifest(self) -> StoreManifest | None:

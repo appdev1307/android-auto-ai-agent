@@ -84,20 +84,37 @@ CUSTOMER_HARD_EXCLUDE_SEGMENTS = {"out", "out_host", ".git", ".repo",
                                   "node_modules", "__pycache__", ".gradle"}
 
 
-def should_index(path: Path, mode: str = "base") -> bool:
+def _rel_for_filter(path: Path, root: Path | None) -> Path:
+    """Path used for segment/substring checks: relative to the AOSP root.
+
+    Checking the ABSOLUTE path made every file under a checkout that happens to
+    live in e.g. /mnt/external/aosp or ~/build/aosp match an excluded segment
+    ("external", "build") -> empty index. Only segments INSIDE the tree count.
+    """
+    if root is not None:
+        try:
+            return path.resolve().relative_to(Path(root).resolve())
+        except Exception:
+            pass
+    return path
+
+
+def should_index(path: Path, mode: str = "base", root: Path | None = None) -> bool:
     """Cheap, decisive filter. False => don't index this file.
 
     mode="base"     : aggressive (AOSP upstream — drop tests/prebuilts/external/…)
     mode="customer" : permissive (OEM overlay — keep tests/external/generated,
                       drop only obvious junk). OEM patches are the whole point.
+    root            : AOSP root; segment checks use the path relative to it.
     """
-    p = path.as_posix().lower()
-    parts = {seg.lower() for seg in path.parts}
+    rel = _rel_for_filter(path, root)
+    p = "/" + rel.as_posix().lower().lstrip("/")
+    parts = {seg.lower() for seg in rel.parts}
 
     # common gates (both modes)
     if path.suffix.lower() not in CODE_EXTS:
         return False
-    if is_hidl(str(path)):
+    if is_hidl(p):
         return False
     try:
         if path.stat().st_size > MAX_INDEX_FILE_BYTES:
@@ -130,7 +147,10 @@ _SPLIT_RE = re.compile(
 
 
 def iter_files(root: Path, extra_roots: list[str] | None = None,
-               mode: str = "base") -> Iterator[Path]:
+               mode: str = "base", filter_root: Path | None = None) -> Iterator[Path]:
+    """Yield indexable files under `root`. `filter_root` (the AOSP root) is what
+    should_index judges path segments against; defaults to `root`."""
+    filter_root = filter_root or root
     roots = [root]
     if extra_roots:
         for r in extra_roots:
@@ -144,7 +164,7 @@ def iter_files(root: Path, extra_roots: list[str] | None = None,
         for path in base.rglob("*"):
             if not path.is_file():
                 continue
-            if not should_index(path, mode=mode):
+            if not should_index(path, mode=mode, root=filter_root):
                 continue
             key = str(path.resolve())
             if key in seen:
@@ -288,18 +308,34 @@ def _first_error(node, src: bytes, limit: int = 5) -> list[str]:
     return errs
 
 
-def parse_ok(text: str, suffix: str) -> tuple[bool, list[str]]:
+_FRAGMENT_WRAP = {"java": ("class __Fragment__ {\n", "\n}\n"),
+                  "kotlin": ("class __Fragment__ {\n", "\n}\n")}
+
+
+def parse_ok(text: str, suffix: str, fragment: bool = False) -> tuple[bool, list[str]]:
     """(is_valid, problems). If the language has no grammar, returns (True, [])
-    — we can't judge, so we don't block (a real build will catch the rest)."""
+    — we can't judge, so we don't block (a real build will catch the rest).
+
+    fragment=True: `text` is ONE member (method/constructor) cut out of a class
+    by read_enclosing_node. A bare Java/Kotlin method is not a valid compilation
+    unit, so it is wrapped in a dummy class before parsing (C++ function
+    definitions are valid at top level and need no wrapper). Error line numbers
+    are shifted back to the fragment's own lines.
+    """
     lang = _AST_LANG.get(suffix.lower())
     parser = _get_parser(lang) if lang else None
     if parser is None:
         return True, []
+    head, tail = _FRAGMENT_WRAP.get(lang, ("", "")) if fragment else ("", "")
     try:
-        tree = parser.parse(bytes(text, "utf-8"))
+        tree = parser.parse(bytes(head + text + tail, "utf-8"))
     except Exception as e:
         return False, [f"parser failed: {e}"]
-    errs = _first_error(tree.root_node, text.encode("utf-8"))
+    errs = _first_error(tree.root_node, (head + text + tail).encode("utf-8"))
+    if head:
+        shift = head.count("\n")
+        errs = [re.sub(r"^line (\d+)", lambda m: f"line {max(1, int(m.group(1)) - shift)}", e)
+                for e in errs]
     return (len(errs) == 0), errs
 
 
@@ -357,6 +393,77 @@ def symbol_window(text: str, symbols: list[str], budget: int = 24000) -> tuple[s
         if not grew:
             break
     return "\n".join(lines[lo:hi + 1]), True
+
+
+def _collect_unit_nodes(node, out: list) -> None:
+    """All method/function nodes (outermost only, like _collect_units)."""
+    if node.type in _UNIT_TYPES:
+        out.append(node)
+        return
+    for ch in node.children:
+        _collect_unit_nodes(ch, out)
+
+
+def read_enclosing_node(path: str, symbol: str, text: str | None = None,
+                        max_chars: int = 24000, root: str | Path | None = None) -> dict | None:
+    """Return the COMPLETE method/function that defines (or else mentions) `symbol`.
+
+    A whole AST unit is syntactically self-contained, so the patch oracle can
+    parse-check it (parse_ok(..., fragment=True)) instead of skipping the check
+    as it must for a char-truncated window.
+
+    Match order: a unit whose NAME is `symbol` (C++ `Cls::fn` matches `fn`),
+    else the smallest unit whose body mentions `symbol` as a whole word.
+    Returns None when there is no grammar for the file, the file can't be read,
+    nothing matches, or the unit is larger than `max_chars` — callers then fall
+    back to symbol_window.
+
+    Result: {"code", "start_line", "end_line" (1-based, inclusive), "name"}.
+    """
+    if not symbol or not path:
+        return None
+    suffix = Path(path).suffix.lower()
+    lang = _AST_LANG.get(suffix)
+    parser = _get_parser(lang) if lang else None
+    if parser is None:
+        return None
+    if text is None:
+        p = Path(path)
+        if not p.is_absolute() and root is not None:
+            p = Path(root) / path
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None
+    src = text.encode("utf-8")
+    try:
+        tree = parser.parse(src)
+    except Exception:
+        return None
+    units: list = []
+    _collect_unit_nodes(tree.root_node, units)
+    if not units:
+        return None
+
+    want = symbol.split("::")[-1].split(".")[-1].strip()
+    word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}(?![A-Za-z0-9_])")
+
+    def _short(n) -> str:
+        return _node_name(n).split("::")[-1].split(".")[-1]
+
+    named = [n for n in units if _short(n) == want]
+    pool = named or [n for n in units
+                     if word.search(src[n.start_byte:n.end_byte].decode("utf-8", "ignore"))]
+    if not pool:
+        return None
+    best = min(pool, key=lambda n: n.end_byte - n.start_byte)
+    # include the full first line (indentation / annotations on the same line)
+    start = src.rfind(b"\n", 0, best.start_byte) + 1
+    code = src[start:best.end_byte].decode("utf-8", "ignore")
+    if len(code) > max_chars:
+        return None
+    return {"code": code, "start_line": best.start_point[0] + 1,
+            "end_line": best.end_point[0] + 1, "name": _node_name(best)}
 
 
 _CPP_SUFFIXES = {".c", ".h", ".hh", ".hpp", ".cpp", ".cc", ".cxx"}

@@ -125,8 +125,12 @@ def run(graph, bug: str, aosp_root: str | None, log: str | None, tenant: dict | 
         "patches": [],
         "unit_tests": [],
         "status": "start",
-        "needs_human_review": True,
+        # Start False: review is RAISED by real triggers (ungrounded diagnosis,
+        # specialist dissent, safety-critical layer, unverified patch). Seeding
+        # True made the flag always True and the metric meaningless.
+        "needs_human_review": False,
         "iterations": 0,
+        "relocalize_count": 0,
         "specialist_notes": [],
     }
     try:

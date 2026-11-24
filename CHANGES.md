@@ -68,12 +68,15 @@ demonstrate the customer/OEM-first retrieval it was built around.
 
 ## Later superseded / still open
 
-The following were listed as out of scope in the first pass; status as of Update 28:
+The following were listed as out of scope in the first pass; status as of Update 29:
 
 - ~~Real tree-sitter AST chunking~~ → **done** (Updates 12–14: Java/Kotlin/C++ AST + parse oracle).
 - ~~`git apply --check`~~ → replaced by in-memory apply + tree-sitter parse (Updates 7–8, 14).
 - Structured machine-readable `patches[]` / `unit_tests[]` extraction → still open (finalize emits prose/sections).
-- Labeled eval harness exists (`eval/`); filling **gold labels from real OEM bugs** is still on the user.
+- Labeled eval harness exists (`eval/`); open-source gold labels can now be mined from AOSP
+  fix commits (`eval/mine_labels.py`, Update 29). Gold labels from **real OEM bugs** are still on the user.
+- Requirement → code workflow nodes exist in `agent/nodes.py` but are **not wired** into
+  `agent/graph.py` / `AgentState` yet.
 - Repoint `index_roots` / scopes at the real OEM tree before production indexing.
 
 ---
@@ -660,3 +663,52 @@ AACP = **Android Auto + Apple CarPlay** (phone projection), distinct from native
 - `prompts/specialists/binder.md`, `hmi.md` — aligned (projection ≠ property mapping)
 - Removed legacy unnumbered duplicates: `skills/AGENTS.md`, `android_automotive.md`,
   `patch_and_ut.md` (content lives in `00-` / `10-` / `20-` files only)
+
+# Update 29 — Run blockers + retrieval/index correctness + AOSP gold-label mining
+
+P0 (agent could not start):
+- `retrieval/chunker.py` — added `read_enclosing_node(path, symbol, text, max_chars, root)`
+  (imported by `agent/nodes.py`, missing → `ImportError` on import). Returns the complete
+  method/function that defines (else mentions) the symbol via tree-sitter, or None
+  (no grammar / too large / no match → `symbol_window` fallback).
+- `agent/diagnosis.py` — `render_diagnosis(dx, rejected=False)`; `finalize` passed
+  `rejected=` → `TypeError` on every run. Rejected root cause is labelled as such.
+
+P1 (ran, but wrong results):
+- `agent/main.py`, `eval/run_eval.py` — initial `needs_human_review` is False (was True →
+  flag always True). Review is raised only by real triggers.
+- `eval/run_eval.py` — tenant resolved via `agent.main._resolve_tenant` (no `--customer` →
+  `_base` store, was the empty legacy index).
+- `agent/nodes.py` — `OPENAI_API_BASE` env overrides `model.api_base`.
+- `agent/nodes.py` — patch on an AST node: `parse_ok(..., fragment=True)` (a bare
+  Java/Kotlin method is wrapped in a dummy class before parsing); hunk headers shifted to
+  real file line numbers (`_offset_hunks`) for both node and symbol-window patches.
+- `retrieval/chunker.py` — `should_index(path, mode, root)` / `iter_files(..., filter_root)`
+  judge path segments relative to the AOSP root (absolute path containing `external`,
+  `build`, `test`, … dropped every file).
+- `retrieval/indexer.py` — per-project git SHAs (`manifest.git_shas`) so `--incremental`
+  works on `repo sync` trees (root is not a git repo → was a silent full rebuild every time);
+  projects leaving scope are purged; a full build starts from an empty collection (stale
+  Chroma chunks no longer survive next to a fresh BM25 corpus).
+- `retrieval/hybrid.py` — hits from all channels canonicalized to aosp_root-relative paths
+  (ripgrep vs indexer paths never fused); file-level RRF (best rank per channel instead of a
+  sum over chunks — large files were inflated); dense hits sorted by similarity before
+  ranking; ripgrep globs + `.cc/.hpp/.kts/.vspec`.
+- `retrieval/store.py` — `CompositeStore.keyword` interleaves per-layer BM25 rankings,
+  customer first (customer hits were always ranked after base); `StoreManifest.git_shas`.
+- `scripts/start_vllm.sh` / `data/config.yaml` — default model Qwen2.5-Coder-32B-Instruct,
+  `MAX_LEN=32768`, `QUANT=none` (prompt ~10k tokens + `max_tokens` 8192 exceeded 8192;
+  `awq` on non-AWQ weights failed).
+- `AAOS_Agent_Colab.ipynb` — `OLLAMA_CONTEXT_LENGTH=32768`, `OLLAMA_NUM_PARALLEL=1`
+  (default context silently truncated the prompt).
+
+P2:
+- `agent/graph.py` / `nodes.after_relocalize` — relocalize with no new candidates goes
+  straight to finalize (was another commit + specialist round on the same target).
+- `finalize` — rejected target no longer listed among the re-localization leads.
+- `.gitignore` — `indexes/`, `stores/`, `.env`, eval outputs.
+
+New:
+- `eval/mine_labels.py` — gold labels from AOSP open-source fix commits (see README
+  *Mining gold labels*). `fixed_in_index` is null (unknown) when the indexed checkout is
+  shallow and lacks the fix commit.

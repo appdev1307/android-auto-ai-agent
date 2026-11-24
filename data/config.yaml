@@ -1,8 +1,11 @@
 model:
-  name: "meta-llama/Llama-3.1-70B-Instruct"
+  name: "Qwen/Qwen2.5-Coder-32B-Instruct"   # served name must match the backend (vLLM/Ollama/Groq)
+  # OPENAI_API_BASE (env) overrides this — switch backend without editing config
   api_base: "http://127.0.0.1:8000/v1"
   temperature: 0.1
   max_tokens: 8192   # raised from 4096: thesis found a single generation needed ~4302; avoids mid-patch truncation
+  # The prompt alone (system + fewshot + skills) is ~10k tokens, so the backend
+  # context must be >= ~10k + max_tokens (scripts/start_vllm.sh: MAX_LEN=32768).
 
 rag:
   enabled: true

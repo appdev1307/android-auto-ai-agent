@@ -22,7 +22,7 @@ Examples:
 
 from __future__ import annotations
 import argparse
-import json
+import os
 import pickle
 import subprocess
 from pathlib import Path
@@ -81,6 +81,55 @@ def _git_changed(root: Path, old_sha: str, new_sha: str) -> tuple[list[Path], li
         else:
             changed.append(p)
     return changed, deleted
+
+
+def _project_dirs(root: Path, scope_roots: list[str]) -> list[str]:
+    """Git projects (relative to `root`) that cover the scope roots.
+
+    A `repo sync` AOSP tree is NOT one git repo — the root has `.repo/`, and
+    every project (packages/services/Car, hardware/interfaces, ...) is its own
+    repo. Asking `git -C <root> rev-parse HEAD` there fails, which silently
+    turned every `--incremental` into a full rebuild. Track one SHA per project.
+    """
+    if (root / ".git").exists():
+        return ["."]
+    roots = [r.strip("/") for r in scope_roots] or ["."]
+
+    def _related(proj: str) -> bool:
+        return any(r in (".", "") or proj == r or proj.startswith(r + "/")
+                   or r.startswith(proj + "/") for r in roots)
+
+    plist = root / ".repo" / "project.list"
+    if plist.exists():
+        projs = [ln.strip() for ln in plist.read_text().splitlines() if ln.strip()]
+        return sorted(p for p in projs if _related(p) and (root / p / ".git").exists())
+
+    found: set[str] = set()
+    for r in roots:
+        # a project that CONTAINS the scope root (hardware/interfaces for
+        # hardware/interfaces/automotive)
+        parts = [] if r in (".", "") else r.split("/")
+        for i in range(1, len(parts)):
+            anc = "/".join(parts[:i])
+            if (root / anc / ".git").exists():
+                found.add(anc)
+        base = root if r in (".", "") else root / r
+        if not base.exists():
+            continue
+        for dirpath, dirnames, _ in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in (".git", ".repo", "out")]
+            if (Path(dirpath) / ".git").exists():
+                found.add(Path(dirpath).relative_to(root).as_posix() or ".")
+    return sorted(found)
+
+
+def _git_shas(root: Path, projects: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for proj in projects:
+        sha = _git_sha(root if proj == "." else root / proj)
+        if sha:
+            out[proj] = sha
+    return out
 
 
 def _ids_for_path(path: str) -> str:
@@ -154,8 +203,16 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
             client.delete_collection(ChromaVectorStore.COLLECTION)
         except Exception:
             pass
-    collection = client.get_or_create_collection(
-        name=ChromaVectorStore.COLLECTION, metadata={"hnsw:space": "cosine"})
+    def _open_collection(fresh: bool):
+        if fresh:
+            try:
+                client.delete_collection(ChromaVectorStore.COLLECTION)
+            except Exception:
+                pass
+        return client.get_or_create_collection(
+            name=ChromaVectorStore.COLLECTION, metadata={"hnsw:space": "cosine"})
+
+    collection = _open_collection(fresh=False)
 
     print(f"Loading embed model: {rag['embed_model']}")
     embedder = SentenceTransformer(rag["embed_model"])
@@ -183,44 +240,75 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
 
     bm25_path = store_dir / "bm25_corpus.pkl"
     prev = StoreManifest.load(store_dir / "manifest.json")
-    new_sha = _git_sha(root)
+
+    # Scope for this run: incremental keeps the scope the store was built with.
+    if incremental and prev is not None:
+        run_roots = prev.index_roots or _resolve_scope_roots(rag, prev.scope or scope)
+    else:
+        run_roots = _resolve_scope_roots(rag, scope)
+    new_shas = _git_shas(root, _project_dirs(root, run_roots))
+    prev_shas = (prev.git_shas if prev and prev.git_shas
+                 else ({".": prev.git_sha} if prev and prev.git_sha else {}))
 
     # ---- decide mode ----------------------------------------------
-    do_incremental = (incremental and not reset and prev is not None
-                      and prev.git_sha and new_sha)
-    diff = None
+    do_incremental = bool(incremental and not reset and prev is not None)
+    changed: list[Path] = []
+    deleted: list[Path] = []
+    gone_projects: list[str] = []
+    if do_incremental and (not prev_shas or not new_shas):
+        print("[incremental] no git SHAs recorded/available for this tree — full rebuild.")
+        do_incremental = False
     if do_incremental:
-        diff = _git_changed(root, prev.git_sha, new_sha)
-        if diff is None:
-            print("[incremental] git diff unavailable (shallow clone?) — full rebuild.")
-            do_incremental = False
+        for proj, new in new_shas.items():
+            old = prev_shas.get(proj)
+            if old == new:
+                continue
+            pdir = root if proj == "." else root / proj
+            if old is None:                       # project newly in scope
+                changed += list(iter_files(pdir, mode=mode, filter_root=root))
+                continue
+            d = _git_changed(pdir, old, new)
+            if d is None:
+                print(f"[incremental] git diff unavailable for {proj} "
+                      f"(shallow clone?) — full rebuild.")
+                do_incremental = False
+                break
+            changed += d[0]
+            deleted += d[1]
+        gone_projects = [p for p in prev_shas if p not in new_shas]
 
     if do_incremental:
-        changed, deleted = diff
         # Scope parity: the full build only indexes files under the scope roots,
         # so incremental must too — otherwise a change OUTSIDE scope (e.g. in
         # frameworks/av when the store is `automotive`) leaks into the index and
         # full vs incremental diverge. Roots come from the manifest (recorded at
         # build time); fall back to resolving the store's scope from config.
-        scope_roots = prev.index_roots or _resolve_scope_roots(rag, prev.scope or scope)
+        scope_roots = run_roots
         changed = [p for p in changed
-                   if should_index(p, mode=mode) and _under_roots(p, root, scope_roots)]
-        print(f"[incremental] {prev.git_sha[:8]}→{new_sha[:8]}  "
-              f"changed={len(changed)} deleted={len(deleted)} scope_roots={len(scope_roots)}")
+                   if should_index(p, mode=mode, root=root) and _under_roots(p, root, scope_roots)]
+        n_proj = sum(1 for p, sha in new_shas.items() if prev_shas.get(p) != sha)
+        print(f"[incremental] projects changed={n_proj} removed={len(gone_projects)}  "
+              f"files changed={len(changed)} deleted={len(deleted)} "
+              f"scope_roots={len(scope_roots)}")
+
+        corpus = []
+        if bm25_path.exists():
+            with open(bm25_path, "rb") as f:
+                corpus = pickle.load(f)
+        # files of projects that left the tree/scope: everything indexed under them
+        for proj in gone_projects:
+            prefix = str((root if proj == "." else root / proj)) + "/"
+            deleted += [Path(c["path"]) for c in corpus if c["path"].startswith(prefix)]
 
         # 1) drop old chunks of every touched file (changed OR deleted) from both stores
         touched = {str(p.resolve()) for p in (changed + deleted)}
         touched |= {str(p) for p in (changed + deleted)}
-        for p in (changed + deleted):
+        for p in set(changed + deleted):
             try:
                 collection.delete(where={"path": str(p)})
                 collection.delete(where={"path": str(p.resolve())})
             except Exception:
                 pass
-        corpus = []
-        if bm25_path.exists():
-            with open(bm25_path, "rb") as f:
-                corpus = pickle.load(f)
         corpus = [c for c in corpus if c["path"] not in touched]
 
         # 2) re-chunk + upsert the changed files
@@ -234,17 +322,21 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
 
     else:
         # ---- full build -------------------------------------------
-        index_roots = _resolve_scope_roots(rag, scope)
+        # Always start from an empty collection: upserting over an old one kept
+        # chunks of deleted/shrunk files in Chroma while BM25 was rewritten
+        # from scratch, so the two channels silently disagreed.
+        collection = _open_collection(fresh=True)
+        index_roots = run_roots     # same roots the SHAs were taken over
         print(f"[scope] {scope or rag.get('default_scope','automotive')} -> {index_roots}")
         files: list[Path] = []
         for rel in index_roots:
             b = root / rel if rel != "." else root
             if b.exists():
-                files.extend(list(iter_files(b, mode=mode)))
+                files.extend(list(iter_files(b, mode=mode, filter_root=root)))
             else:
                 print(f"[skip missing] {b}")
         if not files:
-            files = list(iter_files(root, mode=mode))
+            files = list(iter_files(root, mode=mode, filter_root=root))
         uniq, seen = [], set()
         for f in files:
             k = str(f.resolve())
@@ -266,11 +358,14 @@ def build_index(aosp_root: str, config_path: str = "data/config.yaml", *,
         used_scope = prev.scope if prev else None
     else:
         used_roots = index_roots
-        used_scope = scope or rag.get("default_scope", "automotive")
+        used_scope = ((prev.scope if incremental and prev else None)
+                      or scope or rag.get("default_scope", "automotive"))
     manifest = StoreManifest(embed_model=rag["embed_model"], count=total_chunks,
-                             git_sha=new_sha, index_roots=used_roots, scope=used_scope)
+                             git_sha=new_shas.get("."), index_roots=used_roots,
+                             scope=used_scope, git_shas=new_shas or None)
     (store_dir / "manifest.json").write_text(manifest.to_json())
-    print(f"Done. chunks={total_chunks}  store={store_dir}  git_sha={new_sha}  scope={used_scope}")
+    print(f"Done. chunks={total_chunks}  store={store_dir}  "
+          f"git projects={len(new_shas)}  scope={used_scope}")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ Not a prompt-only skeleton. Includes:
 - Structural / AST-aware chunking + Chroma vector index + BM25 corpus
 - Hybrid retrieve (dense + BM25 + ripgrep) → RRF → normalize → customer/OEM priors → cross-encoder rerank
 - Legacy **HIDL hard-excluded** at index time and hard-dropped at retrieval (A14+ wants AIDL)
-- Aggressive index filter (drops prebuilts/test/external/generated) + **incremental re-index** by git SHA
+- Aggressive index filter (drops prebuilts/test/external/generated) + **incremental re-index** by per-project git SHA
 - Multi-tenant stores: shared AOSP base + per-customer isolated overlay
 - Tools: `hybrid_search`, `read_source`, `lookup_vss_signal`, `find_aidl_interface`, `find_symbol`
 - ReAct tool loop (LangGraph) → **committed diagnosis** → **vertical specialists** (≤5) + consensus → finalize
@@ -73,10 +73,16 @@ python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --aosp-version aosp15 
 **Server / workstation (vLLM example):**
 
 ```bash
-bash scripts/start_vllm.sh
+bash scripts/start_vllm.sh        # Qwen/Qwen2.5-Coder-32B-Instruct, max_len 32768
 export OPENAI_API_BASE=http://127.0.0.1:8000/v1
 export OPENAI_API_KEY=dummy
 ```
+
+`OPENAI_API_BASE` (env) overrides `model.api_base` in `data/config.yaml`, so any
+OpenAI-compatible endpoint (vLLM, Ollama, Groq) can be swapped in without editing config;
+`model.name` must be the model id that endpoint serves. The prompt alone is ~10k tokens and
+`max_tokens` is 8192, so the backend context must be well above 8k (vLLM `MAX_LEN=32768`,
+Ollama `OLLAMA_CONTEXT_LENGTH=32768` — the notebook sets it).
 
 **Colab (dev):** use `AAOS_Agent_Colab.ipynb` — it starts **Ollama** (OpenAI-compatible on
 `http://127.0.0.1:11434/v1`) to avoid vLLM / torch / flashinfer install issues on Colab
@@ -215,11 +221,35 @@ python -m eval.run_eval --labels eval/labels.jsonl --aosp-root $AOSP_ROOT \
     --customer oem-a --project proj1 --k 5 --out eval/results.json
 ```
 
+Without `--customer`, the eval resolves the tenant the same way as `agent.main`
+(config `default_tenant` → the shared `_base` store).
+
 Metrics: **recall@k** and **MRR** (localization), **diff_validated_rate** (fraction whose
 grounded diff matched the real file), and — if you supply `gold_diff_files` —
 **patch_file_hit_rate**. `gold_files` come cheapest from real fix commits in your tree's git
 history (the files the fix touched). Start with 10–15 bugs; it's the ground truth every
-later improvement (prompt, model, LoRA) is measured against.
+later improvement (prompt, model, retrieval) is measured against.
+
+### Mining gold labels from AOSP (`eval/mine_labels.py`)
+
+```bash
+python -m eval.mine_labels --aosp-root $AOSP_ROOT --since 2024-12-01 \
+    --out eval/labels.jsonl --review-out eval/labels_review.csv --mask-symbols
+python -m eval.run_eval --labels eval/labels.jsonl --aosp-root $AOSP_ROOT --k 5
+```
+
+Clones the AOSP projects (tag-less, single branch, shallow by date) from
+`android.googlesource.com` — or `--source local` for the history of a `repo sync` tree —
+and keeps real bug-fix commits: `Bug:` trailer, fix-like subject, ≤3 non-test code files /
+≤200 lines, not reverted, deduped by Bug ID + patch-id, every gold file indexable by the
+same filters the indexer uses (HIDL excluded). Design follows SWE-bench (gold = non-test
+part of the fix, `test_files` kept apart, `base_commit`), Defects4J (small isolated fixes),
+Kochhar et al. ASE'14 (file/symbol names masked in `bug` to avoid "already localized"
+bias), HumanEval/LiveCodeBench (`--since` after the model's release; `commit_date` kept),
+and SWE-bench Verified (`--min-words`, CSV sample for manual review). Each label records
+`fixed_in_index` (true / false / null when the indexed checkout is shallow). AOSP issue
+trackers are mostly private, so `bug` is derived from the commit message — spot-check the
+review sample before reporting numbers.
 
 ---
 
@@ -254,8 +284,10 @@ Bug/logcat
   → agent (LLM + tools)  ⇄  tools (ToolNode)     # ReAct loop
   → commit_diagnosis      # single source of truth (file/layer/symbols)
   → specialists (≤ agent.max_specialists, default 5)
-       + horizontal skill injection + VERDICT consensus
-  → finalize (render diagnosis, grounded patch, UT ideas, human-review)
+       + horizontal skill injection + VERDICT consensus (≤ agent.max_debate_rounds)
+  → relocalize (once, only if owning specialists reject the target)
+       → commit again if it found new candidates, else finalize
+  → finalize (render diagnosis, grounded patch on the enclosing AST node, UT, human-review)
 ```
 
 Vertical specialists (examples): `vhal`, `aidl`, `binder`, `carservice`, `hmi`, `vss`,
@@ -272,7 +304,9 @@ Four layers wired through `AgentState`: **graph** (LangGraph), **tools**
 - **Sparse**: BM25 over the same chunks
 - **Exact**: ripgrep over the roots that were actually indexed — recorded in the store
   manifest (`index_roots`/`scope`) so exact-search matches the vectorized scope
-- **Fuse**: RRF → **min-max normalize to [0,1]** → additive customer/OEM + layer priors →
+- **Paths**: every channel's hits are canonicalized to a path relative to the resolved
+  `aosp_root`, so the same file from dense / BM25 / ripgrep fuses into one hit
+- **Fuse**: file-level RRF (best rank per channel, not summed over chunks) → **min-max normalize to [0,1]** → additive customer/OEM + layer priors →
   cross-encoder rerank with **sigmoid-normalized** CE scores blended against the
   prior-boosted base — so the customer-first boost survives rerank
 - **HIDL (two hard gates)**:
@@ -282,11 +316,18 @@ Four layers wired through `AgentState`: **graph** (LangGraph), **tools**
 
 ### Index filter & incremental (`retrieval/chunker.py`, `indexer.py`)
 
-- `should_index(path, mode)` — `base` mode drops prebuilts/test/external/generated/oversized;
-  `customer` mode keeps almost everything (customer patches land anywhere).
-- `--incremental` — `git diff` the tree's HEAD against the last indexed SHA and touch only
-  changed/added/deleted files in both Chroma and BM25 (pure local diff; no fetching).
-- Manifest records `embed_model`, `git_sha`, and `index_roots`/`scope`.
+- `should_index(path, mode, root)` — `base` mode drops prebuilts/test/external/generated/oversized;
+  `customer` mode keeps almost everything (customer patches land anywhere). Segments are
+  judged **relative to the AOSP root**, so a checkout under e.g. `/mnt/external/aosp` is not
+  filtered out wholesale.
+- `--incremental` — a `repo sync` tree has one git repo **per project**, so the manifest
+  records one SHA per project (`git_shas`, from `.repo/project.list` or a scan of the scope
+  roots). Each project is `git diff`-ed against its last indexed SHA; only changed/added/
+  deleted files are touched in Chroma and BM25. A project whose old SHA is missing
+  (shallow clone) falls back to a full rebuild.
+- A full build always starts from an empty Chroma collection (no stale chunks of
+  deleted/shrunk files left next to a freshly written BM25 corpus).
+- Manifest records `embed_model`, `git_sha` / `git_shas`, and `index_roots`/`scope`.
 
 ### Tools (`agent/tools_def.py`)
 
