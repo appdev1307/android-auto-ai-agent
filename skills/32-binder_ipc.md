@@ -1,41 +1,47 @@
-# Skill — Binder / AIDL IPC (Android)
+# Binder / AIDL IPC
 
-Android cross-process calls use Binder. AIDL generates stubs (`Bn*` server,
-`Bp*` proxy). Vehicle stack: apps → CarService → `IVehicle` (AIDL) → VHAL.
+Path: app → CarService (`ICar` and per-manager binders) → `IVehicle` (AIDL) → VHAL. [S1]
 
-## Hard rules
-1. **Do not ship large payloads over Binder.** Process binder buffer is on the
-   order of ~1MB shared across concurrent transactions; single large parcels
-   often fail earlier. Prefer FD / ashmem / shared memory / URI / path — not
-   giant byte arrays or bitmaps in the Parcel.
-2. **`TransactionTooLargeException`** — shrink the Parcel; never "fix" by
-   catching and ignoring on a critical path without changing the data plane.
-3. **Death recipients** — clients that hold a remote binder to CarService/VHAL
-   must `linkToDeath` / native equivalent, clear local state on death, and
-   re-bind / re-subscribe. Missing death handling → stuck UI after HAL crash.
-4. **Threading** — sync binder calls block the calling thread. Do not call slow
-   HAL work from the main thread (ANR). Server: do not block binder threads on
-   bus I/O; finish async via callback.
-5. **`oneway`** — async, no return value; misuse for methods that must report
-   `StatusCode` hides failures.
-6. **Identity** — `IVehicle` / Car APIs are permission-checked; binder identity
-   is not a substitute for Car permissions.
+## Transaction size
+- The binder transaction buffer is a fixed 1 MB per process, shared by all transactions
+  in progress, so `TransactionTooLargeException` can happen even when each call is
+  moderate in size. [S2]
+- When it is thrown, either the request or the reply did not fit; the caller can't tell
+  which and must assume partial failure. [S2]
+- Fix the data plane: split large requests, cap result sizes, send essentials first. Don't
+  catch and ignore it. [S2]
 
-## AAOS-relevant failure signatures
-| Symptom | Likely Binder angle |
-|---------|---------------------|
-| `DeadObjectException` / `binderDied` after VHAL restart | no death recipient / no resubscribe |
-| `TransactionTooLargeException` | oversized property batch or debug dump over binder |
-| UI hangs on get property | sync binder on main thread or server blocked on binder thread |
-| Works until process kill | missing re-bind on Car/Service reconnect |
+## Remote death
+- `IBinder.linkToDeath(recipient, flags)` registers a `DeathRecipient` that is called when
+  the hosting process dies. Calls to a dead binder throw `DeadObjectException`. [S3]
+- `binderDied()` runs on a binder thread; synchronize shared state. Calling
+  `unlinkToDeath` inside `binderDied` is a no-op. [S4]
+- For CarService, prefer `Car.CarServiceLifecycleListener` (`ready=false` → stop,
+  `ready=true` → re-init) over hand-written death handling. [S5]
+- After CarService restarts, a client that handles the crash (ServiceConnection or
+  CarServiceLifecycleListener) stays alive; a client that doesn't is crashed by the Car
+  library. [S6]
 
-## Native (C++)
-- Use generated NDK/AIDL stubs; check `ScopedAStatus` / service-specific errors.
-- Unlink death recipient in destructor paths; avoid double-unlink.
-- For VHAL clients prefer `libvhalclient` rather than ad-hoc `IVehicle` binds
-  from random daemons (SELinux + lifecycle).
+## Stable AIDL (HAL interfaces)
+- HAL interfaces between system and vendor use stable AIDL: `@VintfStability` and
+  `stability: "vintf"` in `aidl_interface`. [S7]
+- Frozen versions in `aidl_api/<name>/<N>` must never be edited; the owner may only add
+  methods at the end or fields to parcelables. [S7][S8]
+- New method on an older server → `UNKNOWN_TRANSACTION`; clients must handle it. [S8]
 
-## Tests
-- Death: kill server process → client cleans up and recovers.
-- Parcel size: reject oversized payloads at API boundary.
-- Thread: callback not invoked on binder thread if API promises main/executor.
+## Failure signatures
+| Symptom | Check |
+|---|---|
+| `DeadObjectException` / UI stuck after CarService or VHAL restart | lifecycle listener / death recipient re-initializes and re-subscribes |
+| `TransactionTooLargeException` | payload size, batch size, dumps over binder |
+| Works until process kill | re-bind and re-subscribe path |
+
+## Sources
+- [S1] AAOS 101 car framework slides — https://source.android.com/static/docs/automotive/car-framework-core/gapb-2024-aaos-101-day3-carframework-core.pdf
+- [S2] https://developer.android.com/reference/android/os/TransactionTooLargeException
+- [S3] https://developer.android.com/reference/android/os/IBinder
+- [S4] https://developer.android.com/reference/android/os/IBinder.DeathRecipient
+- [S5] https://developer.android.com/reference/android/car/Car.CarServiceLifecycleListener
+- [S6] AOSP commit ee22003 "Force car service crash handling to client" (packages/services/Car)
+- [S7] https://source.android.com/docs/core/architecture/aidl/aidl-hals
+- [S8] https://source.android.com/docs/core/architecture/aidl/stable-aidl-apis

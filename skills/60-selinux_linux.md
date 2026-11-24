@@ -1,46 +1,42 @@
-# Horizontal skill — SELinux (Android) + Linux service basics
+# SELinux on Android (vendor / OEM policy)
 
-## Android SELinux model (AOSP)
-- Policy sources: `*.te`, `file_contexts`, `genfs_contexts`, etc.
-- OEM changes belong in `device/<manufacturer>/<device>/sepolicy` via
-  `BOARD_SEPOLICY_DIRS`, not by forking platform `system/sepolicy` for features.
-- Android 8+ vendor / platform split: vendor policy must not break platform
-  neverallows; vendor types should use `vendor_` prefix to avoid type clashes.
+Confirm an `avc: denied` line in the evidence before touching policy. A Java
+`SecurityException` from a Car API is an Android permission problem, not SELinux.
+
+## Where policy goes
+- Don't modify `system/sepolicy`; add or edit device policy under
+  `device/<manufacturer>/<device>/sepolicy`, included via `BOARD_SEPOLICY_DIRS`. Update
+  existing files where possible. [S1][S2]
+- Android 8.0+: policy in `BOARD_SEPOLICY_DIRS` goes only into the vendor image. [S2]
+- Prefix vendor types and attributes with `vendor_` (`type vendor_foo, domain;`):
+  duplicate declarations fail to compile. [S3]
+- Every new `exec_type` on the vendor partition needs the `vendor_file_type` attribute
+  (enforced by neverallow); avoid labelling vendor files other than `exec_types`. [S3]
 
 ## neverallow
-`neverallow` statements forbid dangerous patterns globally. Compatibility tests
-enforce them. If a denial is backed by neverallow, the fix is redesign
-(relabel, move binary to allowed partition, use existing HAL interfaces) — not
-a blanket `allow`.
+- neverallow rules are enforced across devices by compatibility tests. A denial that only
+  a neverallow-violating `allow` would fix needs a redesign (relabel, use the existing HAL
+  interface, move the code), not a broader rule. [S2]
 
-## Service domain checklist (init daemon)
-1. `type foo, domain;` + `type foo_exec, exec_type, file_type, ...`
-2. `init_daemon_domain(foo)`
-3. `file_contexts`: path → `foo_exec`
-4. Minimal `allow` rules for required binder / file / socket access
-5. Confirm with `avc: denied` reproduction in enforcing mode
-
-## Reading an avc denial
+## New native daemon checklist
 ```
-avc: denied { operation } for ... scontext=u:r:source_domain:s0
-  tcontext=u:object_r:target_type:s0 tclass=...
+type vendor_foo, domain;
+type vendor_foo_exec, exec_type, vendor_file_type, file_type;
+init_daemon_domain(vendor_foo)
+binder_use(vendor_foo)                       # AIDL services
+hal_client_domain(vendor_foo, hal_vehicle)   # only if it is a VHAL client
 ```
-- **scontext** — who is acting (often your daemon or app domain)
-- **tcontext** — what is protected
-- **tclass / operation** — binder, file, dir, …
+Plus a `file_contexts` entry labelling the binary as `vendor_foo_exec`. Start from the
+least privilege that the denials prove necessary. [S2][S3][S4]
 
-Map the denial to the intentional architecture:
-- App needs vehicle data → should use CarService, not open VHAL binder
-- Vendor HAL needs bus device node → label the node and allow only that HAL domain
+## Reading a denial
+`avc: denied { <perm> } for ... scontext=u:r:<source>:s0 tcontext=u:object_r:<target>:s0 tclass=<class>`
+- `scontext` is the acting domain, `tcontext` the object's type, `tclass` + perm the access.
+- An app domain asking for the VHAL binder means the architecture is wrong: apps go
+  through CarService. [S4]
 
-## Linux service basics (relevant to native HALs)
-- init `.rc`: `service` entry, user/group, capabilities — least privilege
-- Do not run vehicle HAL as root if a dedicated user exists
-- Crash loops: init may restart; fix root cause (null deref on bad prop) instead
-  of only widening sepolicy
-- Capabilities: prefer dropping caps; `sys_ptrace` / broad admin caps are
-  neverallow-sensitive
-
-## When SELinux is not the bug
-Permission errors from Car Java APIs (`SecurityException`) are often **Android
-permissions**, not sepolicy. Confirm `avc: denied` before editing `.te` files.
+## Sources
+- [S1] https://source.android.com/docs/security/features/selinux/implement
+- [S2] https://source.android.com/docs/security/features/selinux/customize
+- [S3] https://source.android.com/docs/security/features/selinux/compatibility
+- [S4] https://source.android.com/docs/automotive/vhal/native-client

@@ -12,7 +12,7 @@ method, or symbol you name MUST come verbatim from a tool result in THIS convers
 
 ## Rules
 1. Use tools before answering: hybrid_search, read_source, lookup_vss_signal, find_aidl_interface, find_symbol. Do not answer from memory.
-2. Minimal safe patches only. Follow skills/patch_and_ut.md.
+2. Minimal safe patches only. Follow skills/20-patch_and_ut.md.
 3. NEVER invent paths or emit a unified diff for a file not read via read_source in this run. If unsure → words only (no ---/+++/@@).
 4. Never claim to apply patches. Always needs_human_review for VHAL, VSS contracts, power, SELinux, AIDL.
 5. Prefer customer/OEM (`vendor/`, `device/`) evidence and fix location when both OEM and AOSP match.
@@ -27,7 +27,7 @@ Then a 2-4 sentence root-cause hypothesis, each claim grounded in a retrieved sn
 Do not list a file you have not seen in a tool result.
 
 ## Output for patches
-- Follow skills/patch_and_ut.md.
+- Follow skills/20-patch_and_ut.md.
 - Compliance when editing real files only:
   - Java/Kotlin: AOSP Java + Android Kotlin style
   - C++/native Android services: AOSP C++/clang-format + MISRA C++ / AUTOSAR C++14

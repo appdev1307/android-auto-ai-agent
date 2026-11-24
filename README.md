@@ -169,17 +169,21 @@ every role shares the same rules. No code change to add a pack — drop a new `*
 
 | File | Role |
 |------|------|
-| `CONTRACT.md` | Shared agent rules (validate committed diagnosis; no invented paths) |
-| `00-AGENTS.md` | Operating rules / customer-first |
-| `10-android_automotive.md` | AAOS diagnostic playbook (logcat→layer, data path, power, SELinux) |
-| `20-patch_and_ut.md` | Patch + UT rules (AOSP style; no fake diffs) |
-| `30-aaos_app.md` | Native AAOS / Car UI apps |
-| `32-binder_ipc.md` | Binder / AIDL IPC |
-| `33-android_services.md` | CarService and Android service lifecycle |
-| `34-aacp_projection.md` | **AACP = Android Auto + Apple CarPlay** (projection ≠ VHAL mapping) |
-| `40-sdv_vss.md` | VSS / COVESA mapping |
-| `50-native_hal.md` | Native HAL / C++ |
-| `60-selinux_linux.md` | SELinux + Linux service basics |
+| `CONTRACT.md` | Shared rules, mirroring code: committed diagnosis, grounding, specialist JSON verdict (AGREE/DISAGREE/ABSTAIN), consensus + review gate |
+| `00-AGENTS.md` | Index: symptom → skill, vehicle data path |
+| `10-android_automotive.md` | CarPropertyManager → VHAL diagnosis: property model, StatusCode, subscription, Car lifecycle, power policy |
+| `20-patch_and_ut.md` | Patch loop, AOSP style, stable-AIDL rules, unit-test framework per layer |
+| `30-aaos_app.md` | AAOS apps: Car connection lifecycle, subscriptions, Car UI library / RRO |
+| `32-binder_ipc.md` | Binder: transaction buffer, death handling, stable AIDL versioning |
+| `33-android_services.md` | CarService clients, FGS types (A14+), car watchdog |
+| `34-aacp_projection.md` | **AACP = Android Auto + Apple CarPlay** (projection ≠ VHAL mapping), PROJECTION power component |
+| `40-sdv_vss.md` | COVESA VSS ↔ VHAL mapping: entry types, units, type / change mode |
+| `50-native_hal.md` | VHAL reference architecture, native clients (libvhalclient), dumpsys / VTS |
+| `60-selinux_linux.md` | Vendor sepolicy placement, `vendor_` naming, neverallow, daemon checklist |
+
+Every rule in a skill is tagged `[S#]` and resolved in that file's **Sources** section
+(source.android.com, developer.android.com, COVESA docs, AOSP commits). Customer-specific
+rules (OEM naming, MISRA/AUTOSAR when required) belong in `hints/`, not in skills.
 
 ### Operator hints (`hints/*.md`)
 

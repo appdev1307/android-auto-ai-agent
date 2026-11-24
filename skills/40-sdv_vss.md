@@ -1,32 +1,38 @@
-# Horizontal skill — SDV / VSS (COVESA) and property mapping
+# COVESA VSS ↔ VHAL property mapping
 
-VSS (Vehicle Signal Specification) is a signal catalog model (COVESA). In AAOS
-products it is usually **mapped** to VHAL properties in vendor code — the bug is
-often in the mapping or subscription, not in the catalog file alone.
+VSS is a catalog of vehicle signals; AAOS does not ship it. On products it lives in OEM
+code (often under `vendor/`) and is mapped to VHAL properties. [S1]
 
-## Artifacts
-- COVESA `.vspec` or OEM YAML/JSON signal trees (often under `vendor/`)
-- Mapper code: signal path string ↔ VHAL property id / area
-- Vendor property configs that expose mapped signals
+## VSS data entries
+- Every leaf has `type` (`sensor`, `actuator`, `attribute`; parents are `branch`),
+  `datatype` and `description`. Sensors are read-only, actuators can also be set,
+  attributes are (near-)static values. [S2]
+- `unit` is a free string in `.vspec` files; the syntax does not restrict it. Check the
+  unit on both sides explicitly. [S3]
+- Example leaf: `Vehicle.Speed` — `type: sensor`, `datatype: float`, `unit: km/h`. [S2]
 
-## Engineering checks
-1. **Path exactness** — `Vehicle.Speed` is not an invented synonym of another
-   path; only use paths present in catalog or code.
-2. **Type / unit** — float vs int, km/h vs m/s mismatches show up as "wrong
-   value" not as missing subscription.
-3. **Mapping present but UI stale** — do not "fix" by editing VSS leaves;
-   check CarPropertyManager subscription and power re-register first.
-4. **Missing mapping** — OEM should add vendor mapping / vendor property;
-   prefer not to invent system properties that collide with `VehicleProperty`.
-5. **Customer-first** — OEM signal extensions live under `vendor/`; search
-   there before changing AOSP catalogs.
+## Mapping checks
+1. **Path exactness** — use only signal paths that appear in the catalog or mapper code.
+2. **Unit** — VHAL `PERF_VEHICLE_SPEED` is in `METER_PER_SEC`, negative when reversing;
+   VSS `Vehicle.Speed` is `km/h`. A missing ×3.6 (or a sign drop) shows up as a "wrong
+   value", not a missing subscription. [S2][S4]
+3. **Type and change mode** — a VSS `float` sensor needs a `FLOAT` property; a
+   continuously changing sensor maps to a `CONTINUOUS` property with sample rates, an
+   attribute to `STATIC`. For system properties, type / access / change mode are fixed by
+   `VehicleProperty.aidl`. [S5]
+4. **No new system ids** — a signal with no system property becomes a vendor property
+   (group `VENDOR`), and must not duplicate an existing `VehiclePropertyIds` entry. [S6]
+5. **Mapping correct but UI stale** — don't edit the catalog; follow the subscription and
+   power-policy checks in `10-android_automotive.md`.
 
-## Relation to VHAL
-Mapped signals still obey VHAL access/changeMode/area rules once exposed as
-properties. A continuous signal needs a continuous (or correctly sampled)
-property subscription to reach HMI.
+## Tests
+- Mapping table: signal path → property id / area id, including unit conversion.
+- Property config: type, access, change mode, sample rates for each mapped property.
 
-## Unit tests
-- Mapping table unit tests (path → propId)
-- Property config tests for access/changeMode
-- VTS only when validating the HAL interface contract itself
+## Sources
+- [S1] Project constraint: AOSP ships no VSS catalog; it comes from COVESA (cloned to `vendor/vss` in the Colab notebook) or the customer's `vendor/` tree
+- [S2] https://covesa.github.io/vehicle_signal_specification/rule_set/data_entry/sensor_actuator
+- [S3] https://covesa.github.io/vehicle_signal_specification/rule_set/data_entry/data_units
+- [S4] `PERF_VEHICLE_SPEED` definition in AOSP `VehicleProperty` (`@unit VehicleUnit:METER_PER_SEC`, sign by direction)
+- [S5] https://source.android.com/docs/automotive/vhal/property-configuration
+- [S6] https://source.android.com/docs/automotive/vhal/special-properties

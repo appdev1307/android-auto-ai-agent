@@ -1,55 +1,45 @@
-# Horizontal skill — Native HAL / C++ (VHAL and related)
+# Native VHAL and native clients (C++)
 
-Grounded in AOSP AIDL VHAL reference structure (`DefaultVehicleHal` +
-`IVehicleHardware`), native client library guidance, and practical C++/Linux
-service rules for Android HALs.
+## Reference architecture (AIDL VHAL)
+- Two layers: `DefaultVehicleHal` implements `IVehicle` and holds the generic logic;
+  `IVehicleHardware` is the device-specific part. The reference `IVehicleHardware` is
+  `FakeVehicleHardware` (in-memory, emulator only); vendors must not ship it as-is. [S1]
+- Main service thread: `VehicleService.cpp`; interface implementation:
+  `DefaultVehicleHal.cpp` under `hardware/interfaces/automotive/vehicle/aidl/impl/`. [S1]
+- `DefaultVehicleHal` does the input checks (including duplicate request ids), allocates
+  per-request client objects, checks read / write permission, and periodically calls
+  `IVehicleHardware::checkHealth` and sends the heartbeat. [S1]
+- The list of property configs must be static after VHAL initialization. [S1]
+- Android 14+: `FakeVehicleHardware` reads configs at runtime from
+  `/vendor/etc/automotive/vhalconfig/` (JSON); `persist.vendor.vhal_init_value_override`
+  (set at build time or very early boot) loads overrides from
+  `/vendor/etc/automotive/vhaloverride/`. [S1]
 
-## Architecture (AOSP reference)
-- Upper: `DefaultVehicleHal` — AIDL `IVehicle`, subscription manager, permission
-  checks, large parcelable handling, health heartbeat.
-- Lower: `IVehicleHardware` — device/bus-specific get/set/subscribe.
-- Vendors implement hardware/backend logic; do not ship emulator fake hardware
-  as production.
+## Where a VHAL bug usually is
+| Symptom | Look at |
+|---|---|
+| Property missing in CarService | config list in the hardware layer (static after init) [S1] |
+| `INVALID_ARG` on get / set | prop id / area id not in config; duplicate request id [S1] |
+| Wrong value type, e.g. speed reads 0 | config type vs `VehicleProperty.aidl`; which `*Values` field the hardware layer fills (`floatValues` for `FLOAT`) [S2] |
+| `TRY_AGAIN` forever | backend not ready; must become `OK` or a permanent code [S3] |
+| VHAL killed by watchdog | heartbeat / `checkHealth` path blocked [S4] |
 
-Android 14+: property configs often loaded from vendor config paths
-(e.g. under `/vendor/etc/automotive/vhalconfig/` in reference designs).
+## Native VHAL clients
+- Use `libvhalclient`: `IVhalClient::tryCreate()`, null check, then
+  `getValueSync(*client->createHalPropValue(toInt(VehicleProperty::...)))`. [S5]
+- The client needs its own domain with `init_daemon_domain`, `binder_use` and
+  `hal_client_domain(<domain>, hal_vehicle)`; `hwbinder_use` only for HIDL VHAL. [S5]
 
-## AIDL interface responsibilities
-Implementations must honor async `getValues` / `setValues` callbacks and
-`subscribe` options (property, area, sample rate). Duplicate request IDs and
-null callbacks are invalid argument paths in the reference code — treat them as
-contract bugs if reproduced.
+## Debugging on a device
+- `adb shell dumpsys android.hardware.automotive.vehicle.IVehicle/default --help`;
+  read a value with `--get INFO_VIN` (or the hex id), set with `--set`. [S6]
+- VTS `VtsHalAutomotiveVehicle_TargetTest` checks the configs of all supported system
+  properties and basic VHAL operations. [S6]
 
-## C++ engineering rules (HAL-relevant)
-Aligned with common automotive / Android native practice (MISRA/AUTOSAR mindset,
-not a full standard dump):
-
-1. **No blocking work on binder threads** — dispatch bus I/O to worker threads;
-   complete binder calls quickly; use callbacks for async results.
-2. **Lifetime management** — clear ownership for callbacks and subscribed clients;
-   handle binder death (unlink death recipient, drop subscription state).
-3. **Deterministic error returns** — map backend failures to `StatusCode`; do not
-   crash the HAL process on bad client input.
-4. **Thread safety** — protect subscription maps and property caches with clear
-   locking; avoid data races on publish paths.
-5. **No dynamic policy in hot paths** — prefer preconfigured property tables;
-   avoid unbounded allocation on every frame of continuous properties.
-6. **Style** — AOSP clang-format for C++; keep patches minimal.
-
-## Linux / process rules
-- HAL runs as a native service (init `.rc`); crashes take down vehicle property
-  traffic — prefer recoverable `StatusCode` over `abort` on bad input.
-- File descriptors, sockets to the vehicle bus: check return codes; handle
-  `EINTR` / `EAGAIN` where appropriate.
-- Logging: use Android log (`ALOG*`) with prop ids, not `printf` only.
-
-## SELinux interaction
-Native VHAL clients need sepolicy allows for binder to vehicle HAL domains.
-New OEM native daemons: own domain via `init_daemon_domain`, labeled exec in
-`file_contexts`, vendor policy under device sepolicy tree — not platform
-neverallow violations.
-
-## Unit tests
-- GoogleTest + gmock for hardware backend and subscription manager
-- Tests for: subscribe → publish → unsubscribe; binder death clears client
-- VTS for interface conformance when changing AIDL-facing behavior
+## Sources
+- [S1] https://source.android.com/docs/automotive/vhal/reference-implementation
+- [S2] https://source.android.com/docs/automotive/vhal/property-configuration (property type → value field)
+- [S3] `StatusCode.aidl` in AOSP (`TRY_AGAIN`: transient; retry will likely succeed)
+- [S4] https://source.android.com/docs/automotive/watchdog/wd_system_health
+- [S5] https://source.android.com/docs/automotive/vhal/native-client
+- [S6] https://source.android.com/docs/automotive/vhal/vhal_debug

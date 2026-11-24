@@ -1,123 +1,80 @@
-# Android Automotive OS (AAOS) full-stack diagnostic skill
+# AAOS vehicle-data diagnosis (CarPropertyManager → VHAL)
 
-Grounded in AOSP automotive documentation (source.android.com): VHAL AIDL,
-property configuration, power policy, CarPropertyManager path, and SELinux
-client rules. Target: Android 14+ / 15 (AIDL VHAL). HIDL VHAL is legacy and
-must not be used as the fix pattern unless the bug is explicitly a migration.
+Find the first hop where the value is wrong, missing or stale. Each rule cites a source
+at the end of this file.
 
-## 1. Stack data path (localize the first broken hop)
-
+## Workflow
 ```
-App / HMI
-  → CarPropertyManager (Java API)
-  → CarPropertyService / CarService
-  → AIDL IVehicle (android.hardware.automotive.vehicle)
-  → VHAL implementation (DefaultVehicleHal + IVehicleHardware)
-  → vehicle bus / OEM mapping (often VSS ↔ property under vendor/)
+- [ ] 1. Pin the property: name / id and areaId from logcat or the bug (no invented ids)
+- [ ] 2. Search vendor/ and device/ for the property id, mapping and HMI client
+- [ ] 3. Check the property config against the spec (section "Property model")
+- [ ] 4. Walk the path hop by hop; stop at the first wrong or missing value
+- [ ] 5. Only then commit a target file
 ```
 
-Rules:
-- Apps must use Car APIs (`CarPropertyManager`), not talk to VHAL directly.
-  SELinux blocks direct app→VHAL access (AOSP native-client guidance).
-- Native daemons use `libvhalclient` (`IVhalClient`) from Android 13+, not ad-hoc binder.
-- OEM behavior often diverges in `vendor/` and `device/` — search those before blaming AOSP.
+## Who may talk to VHAL
+- CarService is the only Java client of VHAL. Car apps use the Car APIs
+  (`CarPropertyManager`); SELinux blocks direct app access. [S1]
+- Native clients use `libvhalclient` (`IVhalClient::tryCreate()`) from Android 13, and
+  need sepolicy (`hal_client_domain(<domain>, hal_vehicle)`). [S1]
+- An app opening `IVehicle` directly is the wrong layer, not a missing permission.
 
-## 2. Logcat / symptom → starting layer
+## Property model
+- Property id = unique id (16 bits) | type (8) | area type (4) | group (4); group is
+  `SYSTEM` (0x10000000) or `VENDOR` (0x20000000). Example: `INFO_VIN` = 0x11100100. [S2]
+- Android 14+: system properties are defined in
+  `hardware/interfaces/automotive/vehicle/aidl_property/.../VehicleProperty.aidl`. [S3]
+- For system properties, `access` and `changeMode` must equal the values documented in
+  `VehicleProperty.aidl`. With per-area access, the global `access` is the maximal subset
+  (one area `READ`, another `READ_WRITE` → `READ`). [S2]
+- `changeMode`: `STATIC` never changes after boot; `ON_CHANGE` is reported on change;
+  `CONTINUOUS` is reported at the subscription sample rate, bounded by
+  `minSampleRate` / `maxSampleRate`. [S2]
+- Zoned properties need `areaConfigs`; an area id is a bit-OR of the area type's enum
+  flags (for example `ROW_1_LEFT | ROW_1_RIGHT`). [S2] Check that the client subscribes
+  to an area id the config actually lists.
+- Android 15: `supportVariableUpdateRate` on continuous properties delivers only changed
+  values; a fixed-rate subscriber disables it for that property. [S2]
+- Vendor properties are a last resort, must not duplicate existing
+  `VehiclePropertyIds`, and default to `android.car.Car.PERMISSION_VENDOR_EXTENSION`. [S4]
 
-| Signature | Start layer | What to verify first |
-|-----------|-------------|----------------------|
-| `FATAL EXCEPTION` / NPE in Car app, Fragment, Compose | HMI | null property value, wrong areaId, callback thread |
-| `CarPropertyService` / `CarPropertyManager` | CarService | subscription table, permission, property config cache |
-| `TransactionTooLarge` / `DeadObjectException` / `IVehicle` | AIDL / binder | parcel size, binder death, service restart |
-| `VehicleHal` / `getValues` / `setValues` / `StatusCode` | VHAL | prop config, StatusCode, hardware backend |
-| `Vehicle.*` unknown / mapping / catalog | VSS / vendor mapping | signal path string, type/unit, missing map entry |
-| `avc: denied` / `neverallow` | SELinux | domain, allow rule, vendor sepolicy only |
-| `PERMISSION_` / `SecurityException` (Car) | permission | Car permission / vendor extension permission |
-| Stops updating after ignition / suspend / resume | startup_power + client | power policy listener + re-subscribe |
+## StatusCode semantics (VHAL)
+- `TRY_AGAIN`: transient, a retry will likely succeed (for example while booting). [S5]
+- `NOT_AVAILABLE` / `NOT_AVAILABLE_DISABLED`: stays unavailable until some other state
+  changes, e.g. setting HVAC temperature while HVAC power is off. A retry loop is wrong. [S5][S6]
+- `NOT_AVAILABLE_SPEED_LOW|SPEED_HIGH|POOR_VISIBILITY|SAFETY`: detailed unavailability,
+  added for ADAS properties. [S5]
+- Java clients see errors through `CarPropertyEventCallback.onErrorEvent(propertyId,
+  areaId, errorCode)`; prefer overriding the 3-argument form. [S7]
 
-## 3. VHAL property model (AOSP)
+## Client subscription (Java)
+- Current API: `CarPropertyManager.subscribePropertyEvents(...)`; the `registerCallback`
+  overloads are deprecated. Match what the target file already uses. [S8]
+- Obtain `Car` with `Car.createCar(context, handler, waitTimeoutMs, listener)`. On
+  `onLifecycleChanged(car, false)` CarService crashed: stop using managers; on
+  `ready == true` get managers again and re-subscribe. [S9]
 
-Property identity is not a free integer. System properties are defined in
-`VehicleProperty.aidl` / property AIDL (Android 14+ split). Config fields that
-must match the published spec:
+## Power policy (stale after ignition / resume)
+- The car power policy daemon is the single source of truth for power policy;
+  CarPowerManagementService delegates to it. [S10]
+- VHAL requests policies through `POWER_POLICY_REQ` / `POWER_POLICY_GROUP_REQ`; the
+  daemon reports changes made by others through `CURRENT_POWER_POLICY`. [S10]
+- Listeners: Java `CarPowerManager` power-policy listener (system-privileged modules);
+  native `ICarPowerPolicyServer.registerPowerPolicyChangeCallback(callback, filter)`.
+  Register with a filter for your components and act when notified. [S10]
+- A policy changes only the components it covers; `PROJECTION`, `AUDIO`, `DISPLAY`, … are
+  separate components. [S10]
+- Defaults are applied on every entry into Wait for VHAL / On, including a cancelled
+  shutdown. Code that only initializes at boot misses these transitions. [S10]
 
-- **access**: `READ` | `WRITE` | `READ_WRITE` (system props: only allowed modes)
-- **changeMode**: `STATIC` | `ON_CHANGE` | `CONTINUOUS`
-- **area**: GLOBAL or area bitmasks; per-area access must be consistent
-- **sample rate**: continuous properties only; subscription Hz must be within min/max
-
-AIDL `IVehicle` surface (conceptual):
-
-- `getAllPropConfigs` / `getPropConfigs`
-- `getValues` / `setValues` (async + callback)
-- `subscribe` / `unsubscribe` with `SubscribeOptions` (propId, areaId, sample rate)
-
-Status handling that causes real field bugs:
-
-- `OK` — success
-- `TRY_AGAIN` — transient; client should retry (not treat as permanent failure)
-- `NOT_AVAILABLE` — e.g. property powered off / not ready
-- `INVALID_ARG` — bad propId/areaId/value
-- `INTERNAL_ERROR` — HAL/backend failure
-
-Vendor properties: last resort; default permission
-`android.car.Car.PERMISSION_VENDOR_EXTENSION`; prefer system properties first
-(AOSP special-properties guidance).
-
-## 4. Subscription and "value not updating"
-
-For continuous properties, VHAL emits by sample rate (or bus rate). For
-ON_CHANGE, emit on value/status change.
-
-Typical break points when mapping is correct but UI is stale:
-
-1. **Client** did not re-register `CarPropertyManager.registerCallback` /
-   listener after Car connection drop or process death.
-2. **Power policy** transition tore down listeners; no re-subscribe on
-   `CarPowerManager` policy change / lifecycle resume.
-3. **CarService** subscription not restored after VHAL binder death.
-4. **VHAL** unsubscribe on sleep and never subscribe again on wake.
-5. AreaId mismatch: subscribed area ≠ producing area.
-
-Trace one property end-to-end before proposing a patch.
-
-## 5. Power policy (AOSP automotive power)
-
-Car power policy daemon is the system source of truth for power policy state.
-It interacts with VHAL via special properties, including:
-
-- `POWER_POLICY_REQ` / `POWER_POLICY_GROUP_REQ` (VHAL → policy daemon)
-- `CURRENT_POWER_POLICY` (daemon → VHAL when others change policy)
-
-Native clients can use `ICarPowerPolicyServer` / change callbacks.
-Java privileged modules use `CarPowerManager` (get/apply policy, register
-listeners). App-layer fixes that ignore power policy will regress on ignition
-cycles.
-
-## 6. SELinux (Android model, automotive clients)
-
-- Do not edit platform `system/sepolicy` for OEM features; put policy under
-  `device/<oem>/<device>/sepolicy` and `BOARD_SEPOLICY_DIRS`.
-- Vendor types should be namespaced (`vendor_`) to avoid duplicate type errors.
-- Init-started daemons need their **own domain** (`init_daemon_domain`), not
-  shared permissive domains.
-- `neverallow` rules are enforced across devices — do not "fix" denials by
-  punching holes that violate neverallows; relabel or move the access to an
-  allowed path.
-- Native VHAL clients need explicit binder allows; apps go through CarService.
-
-Log pattern: `avc: denied { ... } for ... scontext=... tcontext=...`.
-Fix domain is sepolicy, not the Java caller, when the call path is intentional.
-
-## 7. Investigation order (customer-first)
-
-1. Confirm symptom and property/signal id from logcat (no invented ids).
-2. Search `vendor/` + `device/` overlays for mapping, RRO, custom HAL, HMI.
-3. Walk the data path hop-by-hop until the first wrong/missing value.
-4. Only then change AOSP paths; prefer minimal OEM overlay fixes.
-5. Any VHAL / AIDL / SELinux / power change → human review.
-
-## 8. What this skill is not
-
-Not a full Android framework encyclopedia (Activity, media, telephony, ...).
-Not a substitute for code evidence from RAG. Use tools; bind to retrieved paths.
+## Sources
+- [S1] https://source.android.com/docs/automotive/vhal/native-client
+- [S2] https://source.android.com/docs/automotive/vhal/property-configuration
+- [S3] https://source.android.com/docs/automotive/vhal/system-properties
+- [S4] https://source.android.com/docs/automotive/vhal/special-properties
+- [S5] `hardware/interfaces/automotive/vehicle/aidl/android/hardware/automotive/vehicle/StatusCode.aidl` (AOSP)
+- [S6] https://source.android.com/docs/automotive/vhal/properties
+- [S7] https://developer.android.com/reference/android/car/hardware/property/CarPropertyManager.CarPropertyEventCallback
+- [S8] https://developer.android.com/reference/android/car/hardware/property/CarPropertyManager
+- [S9] https://developer.android.com/reference/android/car/Car.CarServiceLifecycleListener
+- [S10] https://source.android.com/docs/automotive/power/power_policy

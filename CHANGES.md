@@ -743,3 +743,38 @@ New:
 - Step 2 no longer exports `OPENAI_API_BASE`; it removes any stale value so
   `data/config.yaml` is the single source of the endpoint.
 
+# Update 32 — Skills rewritten from sources
+
+All `skills/*.md` rewritten (same file names, so the loader and the horizontal-pack
+routing in `agent/specialists.py` are unchanged). Every rule is tagged `[S#]` and resolved
+in the file's **Sources** section: source.android.com (VHAL property configuration,
+native client, reference implementation, special properties, debug, power policy, car
+watchdog, Car UI library, SELinux implement / customize / compatibility, AIDL HALs and
+stable-AIDL API guidelines, Java code style), developer.android.com (CarPropertyManager,
+CarPropertyEventCallback, Car.CarServiceLifecycleListener, IBinder / DeathRecipient,
+TransactionTooLargeException, FGS types in Android 14, Android for Cars), COVESA VSS docs,
+and AOSP sources / commits (StatusCode.aidl, PERF_VEHICLE_SPEED, packages/services/Car tests).
+Authoring follows Anthropic's skill best practices (concise, consistent terms, checklists,
+one level of references, no invented examples).
+
+Fixes against the previous skills:
+- CONTRACT §4/§7 described `VERDICT: AGREE|DISAGREE|PARTIAL` and "specialists do not
+  negotiate"; the code uses a JSON verdict (AGREE/DISAGREE/ABSTAIN + owns_layer, confidence,
+  target, reason) and debate rounds. CONTRACT now mirrors the code, including the exact
+  human-review gate.
+- `20-patch_and_ut.md` imposed MISRA C++ / AUTOSAR C++14 on AOSP patches (not an AOSP
+  requirement) and contained C++ test skeletons with invented APIs (`IVehicleClient`,
+  `PowerState::ON`, `isSubscribed()`) — the same kind of symbol the UT consistency check
+  flags. Replaced with the AOSP code-style rules, the stable-AIDL rules and real test
+  locations (`carservice_unit_test`, `atest CarServiceUnitTest`,
+  `VtsHalAutomotiveVehicle_TargetTest`). MISRA/AUTOSAR now only via `hints/`.
+- New facts with sources: `subscribePropertyEvents` (registerCallback deprecated),
+  `CarServiceLifecycleListener` re-init, full StatusCode set incl. NOT_AVAILABLE_*,
+  `supportVariableUpdateRate` (A15), vendor-property permission, power-policy daemon as
+  single source of truth, PROJECTION power component, watchdog timeouts, `vendor_` type
+  prefix, VSS km/h vs VHAL m/s for speed.
+- Skill text loaded into the system prompt: ~36.5k → ~30.5k chars (system prompt
+  ~42.7k → ~36.6k chars).
+- `prompts/system.md` pointed to `skills/patch_and_ut.md`, which no longer exists →
+  `skills/20-patch_and_ut.md`.
+
