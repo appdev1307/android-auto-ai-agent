@@ -1,7 +1,6 @@
 """Structured tools for the agent — hybrid RAG backed."""
 
 from __future__ import annotations
-from typing import Any
 from langchain_core.tools import tool
 
 # Retriever injected at runtime

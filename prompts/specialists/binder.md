@@ -12,5 +12,4 @@ Validate the committed diagnosis against Binder engineering rules:
 - Apps talk to CarService, not raw IVehicle (SELinux + design).
 
 Do NOT own VSS catalogs or CarPlay session UI. Obey CONTRACT.md.
-First line: VERDICT: AGREE|DISAGREE|PARTIAL
-Then: target file from evidence only; one-line why with symbol/snippet.
+Return only the JSON verdict defined in CONTRACT.md §3: owns_layer=false → ABSTAIN; DISAGREE → put the correct path from the evidence in `target`; `reason` cites a symbol or snippet.

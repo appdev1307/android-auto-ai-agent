@@ -3,6 +3,7 @@
 
 import os
 import sys
+import json
 import argparse
 from pathlib import Path
 from dotenv import load_dotenv
@@ -58,6 +59,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bug", type=str, help="Bug description")
     ap.add_argument("--logcat", type=str, help="Path to logcat file")
+    ap.add_argument("--bug-file", type=str, default=None,
+                    help="JSON (or one-line JSONL) record in the eval label schema: "
+                         "bug, logcat | logcat_file; gold fields are ignored here")
     ap.add_argument("--aosp-root", type=str, default=os.environ.get("AOSP_ROOT"))
     # Tenant routing (IP isolation). Explicit --customer wins; when omitted we
     # fall back to config default_tenant so base-only loads the _base store.
@@ -83,11 +87,64 @@ def main():
                 break
             run(graph, bug, args.aosp_root, None, tenant)
     else:
-        bug = args.bug or "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON"
-        log = None
-        if args.logcat and Path(args.logcat).exists():
-            log = Path(args.logcat).read_text(errors="ignore")[:50000]
+        rec = load_bug_record(args.bug_file) if args.bug_file else {}
+        bug = args.bug or rec.get("bug") \
+            or "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON"
+        if args.logcat:
+            log = _read_logcat(args.logcat)
+        else:
+            log = resolve_logcat(rec, Path(args.bug_file).parent if args.bug_file else None)
         run(graph, bug, args.aosp_root, log, tenant)
+
+
+def _read_logcat(path: str, limit: int = 50000) -> str | None:
+    """Read a logcat file, dropping `#` comment lines.
+
+    Fixture files in test_data/ start with `# BUG:` / `# LAYER:` headers that state
+    the answer; feeding them to the agent leaks the root cause into retrieval and the
+    prompt. Real logcat lines never start with `#`.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    lines = [ln for ln in p.read_text(errors="ignore").splitlines()
+             if not ln.lstrip().startswith("#")]
+    return "\n".join(lines)[:limit]
+
+
+def resolve_logcat(rec: dict, base_dir: Path | None = None) -> str | None:
+    """Logcat text for a bug / label record (same rules for agent.main and eval).
+
+    `logcat`      : inline logcat text.
+    `logcat_file` : path, relative to the record file's directory, then to the repo
+                    root; read with _read_logcat (comment lines dropped).
+    """
+    if rec.get("logcat"):
+        return "\n".join(ln for ln in str(rec["logcat"]).splitlines()
+                         if not ln.lstrip().startswith("#"))
+    lf = rec.get("logcat_file")
+    if not lf:
+        return None
+    repo = Path(__file__).resolve().parents[1]
+    for cand in ([base_dir / lf] if base_dir else []) + [Path(lf), repo / lf]:
+        if cand.exists():
+            return _read_logcat(str(cand))
+    raise FileNotFoundError(f"logcat_file not found: {lf}")
+
+
+def load_bug_record(path: str) -> dict:
+    """One bug record from a .json object or the first line of a .jsonl file.
+    Accepts the legacy key `bug_report` for `bug`."""
+    text = Path(path).read_text()
+    try:
+        rec = json.loads(text)
+    except json.JSONDecodeError:
+        rec = json.loads(next(l for l in text.splitlines() if l.strip()))
+    if "bug" not in rec and "bug_report" in rec:
+        rec["bug"] = rec["bug_report"]
+    if not rec.get("bug"):
+        raise SystemExit(f"{path}: record has no 'bug'")
+    return rec
 
 
 def _framed_task(bug: str, log: str | None) -> str:

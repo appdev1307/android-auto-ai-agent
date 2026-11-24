@@ -739,14 +739,21 @@ def guess_layer(path: str) -> str:
         return "hidl_legacy"
     if is_selinux(p):
         return "selinux"
-    if any(x in p for x in ("/vss", "signal", "covesa", ".vspec")):
+    # "signal" alone is not a VSS marker (e.g. telephony SignalStrength.java).
+    if any(x in p for x in ("/vss", "covesa", ".vspec")):
         return "vss"
-    if p.endswith(".aidl") or "/aidl" in p:
+    if p.endswith(".aidl"):
         return "aidl"
     if any(x in p for x in ("libbinder", "/binder/", "bnvehicle", "bpvehicle")):
         return "binder"
+    # Before the "/aidl" directory check: the AIDL VHAL implementation lives under
+    # hardware/interfaces/automotive/vehicle/aidl/impl/ and is VHAL code, not an
+    # interface definition (it used to be tagged "aidl", so the vhal specialist
+    # never owned DefaultVehicleHal / FakeVehicleHardware).
     if "hardware/interfaces/automotive" in p or "vehiclehal" in p or "/vhal" in p:
         return "vhal"
+    if "/aidl" in p:
+        return "aidl"
     if any(x in p for x in ("powerpolicy", "power_policy", "early_init")):
         return "startup_power"
     if "packages/services/car" in p:

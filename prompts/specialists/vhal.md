@@ -5,6 +5,7 @@ When inspecting evidence for the bug, focus on:
 - Property config: is the property declared? correct areaId config, access (READ/WRITE), changeMode?
 - getValues / setValues: return StatusCode correctly? handles the property id?
 - Subscription in the HAL: is the callback wired and re-armed after power/resume?
-- Type/areaId mismatch between the VHAL config and what CarService expects.
+- Type/areaId mismatch between the VHAL config and `VehicleProperty.aidl` / what CarService expects
+  (e.g. a FLOAT property filled through `int32Values`).
 Do NOT propose changes in Java/AIDL layers — only judge the VHAL side.
-Output: is the root cause likely in VHAL? which exact file(s) from the evidence? one-line why, grounded in a snippet.
+Return only the JSON verdict defined in CONTRACT.md §3: owns_layer=false → ABSTAIN; DISAGREE → put the correct path from the evidence in `target`; `reason` cites a symbol or snippet.

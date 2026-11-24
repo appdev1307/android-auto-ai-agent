@@ -260,8 +260,8 @@ def relocalize(state: AgentState) -> Dict[str, Any]:
         return {"relocalize_count": count, "status": "relocalize_empty"}
     # Drop the rejected file, then (when impl is implicated) float implementation-
     # shaped paths above interface decls so `commit` re-localizes onto the code that
-    # runs, not the .aidl it already rejected. Note: guess_layer tags impl .cpp under
-    # aidl/impl as "aidl" too, so layer alone can't separate them — use path shape.
+    # runs, not the .aidl it already rejected. Path shape (not layer) separates impl from
+    # interface, so this also works for non-VHAL AIDL HALs.
     # Soft, stable re-rank: nothing is invented, hits are only reordered/filtered.
     excl_stem = (dx.get("file", "") or "").split("/")[-1].lower()
 

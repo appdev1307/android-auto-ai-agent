@@ -9,8 +9,12 @@ Metrics that need NO gold diff (cheap, do these first):
 Metric that needs a gold diff (optional):
   - patch-file hit          : does the agent's patch touch a gold_diff_file?
 
-Label file: JSONL, one bug per line. See eval/labels.example.jsonl. Schema:
-  {"id","bug","logcat"?,"gold_files":[...],"gold_diff_files":[...]?,"notes"?}
+Label file: JSONL, one bug per line. Schema (eval/labels.example.jsonl shows it with
+placeholders; real labels come from eval/mine_labels.py or your own fix commits):
+  {"id","bug","logcat"? | "logcat_file"?,"gold_files":[...],"gold_diff_files":[...]?,"notes"?}
+  - gold paths are relative to --aosp-root (the indexed tree); suffix match is used.
+  - logcat_file is relative to the label file, then the repo root; `#` lines are dropped.
+  - the same record runs in the demo: python -m agent.main --bug-file <record.json>
 
 Usage:
   python -m eval.run_eval --labels eval/labels.jsonl --aosp-root $AOSP_ROOT \
@@ -29,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent.graph import build_graph
 from agent.state import AgentState
 from langchain_core.messages import HumanMessage
-from agent.main import _framed_task, _load_cfg, _resolve_tenant
+from agent.main import _framed_task, _load_cfg, _resolve_tenant, resolve_logcat
 
 
 # ── scoring helpers ──────────────────────────────────────────────
@@ -68,10 +72,11 @@ def _diff_files(text: str) -> list[str]:
 
 
 # ── run one bug ──────────────────────────────────────────────────
-def run_one(graph, rec: dict, aosp_root, tenant, k: int) -> dict:
+def run_one(graph, rec: dict, aosp_root, tenant, k: int, labels_dir=None) -> dict:
+    log = resolve_logcat(rec, labels_dir)
     state: AgentState = {
-        "messages": [HumanMessage(content=_framed_task(rec["bug"], rec.get("logcat")))],
-        "bug_report": rec["bug"], "logcat_snippet": rec.get("logcat"),
+        "messages": [HumanMessage(content=_framed_task(rec["bug"], log))],
+        "bug_report": rec["bug"], "logcat_snippet": log,
         "aosp_root": aosp_root, "tenant": tenant, "task_type": "localize_patch",
         "evidence": [], "diagnosis": {}, "candidate_files": [], "root_cause": None,
         "patches": [], "unit_tests": [], "status": "start",
@@ -125,12 +130,29 @@ def main():
     # default_tenant (the shared _base store), not the legacy flat index_dir.
     tenant = _resolve_tenant(args, _load_cfg())
     recs = [json.loads(l) for l in Path(args.labels).read_text().splitlines() if l.strip()]
-    graph = build_graph()
 
+    # Data/eval consistency: a gold file that is not in the indexed tree can never be
+    # retrieved, so the item measures nothing. Report it instead of silently scoring 0.
+    missing: dict[str, list[str]] = {}
+    if args.aosp_root:
+        root = Path(args.aosp_root)
+        for rec in recs:
+            miss = [g for g in rec.get("gold_files", []) if not (root / g).is_file()]
+            if miss:
+                missing[rec["id"]] = miss
+        for rid, miss in missing.items():
+            print(f"[eval] WARNING {rid}: gold file(s) not in {root}: {', '.join(miss)}")
+    else:
+        print("[eval] WARNING no --aosp-root: gold files not checked against the tree")
+
+    graph = build_graph()
+    labels_dir = Path(args.labels).resolve().parent
     rows = []
     for rec in recs:
         print(f"[eval] {rec['id']} …", flush=True)
-        rows.append(run_one(graph, rec, args.aosp_root, tenant, args.k))
+        row = run_one(graph, rec, args.aosp_root, tenant, args.k, labels_dir)
+        row["gold_missing_in_tree"] = missing.get(rec["id"], [])
+        rows.append(row)
 
     scored = [r for r in rows if "error" not in r]
     n = len(scored) or 1
@@ -142,6 +164,7 @@ def main():
         "mrr": round(sum(r["rr"] for r in scored) / n, 3),
         "produced_diff_rate": round(sum(r["produced_diff"] for r in scored) / n, 3),
         "diff_validated_rate": round(sum(r["diff_validated"] for r in scored) / n, 3),
+        "n_gold_missing_in_tree": len(missing),
     }
     ph = [r["patch_file_hit"] for r in scored if r["patch_file_hit"] is not None]
     if ph:

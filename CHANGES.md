@@ -778,3 +778,63 @@ Fixes against the previous skills:
 - `prompts/system.md` pointed to `skills/patch_and_ut.md`, which no longer exists →
   `skills/20-patch_and_ut.md`.
 
+
+# Update 33 — start_vllm.sh: tool calling + served name
+
+- `--enable-auto-tool-choice --tool-call-parser hermes`: the agent binds tools; without
+  them vLLM rejects tool requests or returns tool calls as plain text.
+- Default checkpoint `Qwen/Qwen2.5-Coder-32B-Instruct-AWQ`, served as
+  `Qwen/Qwen2.5-Coder-32B-Instruct` (= `model.name` in config): bf16 32B leaves too little
+  KV cache for a 32k context on 80 GB. Quantization auto-detected (`QUANT` optional).
+- Binds `127.0.0.1` by default (`HOST` to override); `--gpu-memory-utilization` exposed;
+  `VLLM_USE_FLASHINFER_SAMPLER=0`; uses the `vllm serve` CLI; dropped `--trust-remote-code`
+  (Qwen2.5 is native in transformers).
+
+# Update 34 — Full-repo check fixes
+
+- `agent/main.py` — `--logcat` drops `#` comment lines (`_read_logcat`). The
+  `test_data/*.logcat` fixtures start with `# BUG:` / `# LAYER:` headers that state the
+  root cause; they went straight into seed retrieval and the prompt, so demo runs were
+  told the answer.
+- `retrieval/chunker.py` `guess_layer` — VHAL implementation under
+  `hardware/interfaces/automotive/vehicle/aidl/impl/` is `vhal` (was `aidl`, so the vhal
+  specialist never owned DefaultVehicleHal / FakeVehicleHardware); `.aidl` files stay
+  `aidl`. `signal` alone no longer means `vss` (telephony `SignalStrength.java` was vss).
+  Layers are stored at index time → re-index with `--reset`.
+- `data/config.yaml` — `customer_path_boost` drops `vss` / `signal` (they gave the
+  customer prior to any path containing them).
+- `prompts/specialists/*.md` — every prompt asked for `VERDICT: AGREE|DISAGREE|PARTIAL`
+  or free text, contradicting the JSON contract appended by code. All now point to
+  CONTRACT §3. hmi: `subscribePropertyEvents` (registerCallback deprecated); aidl/vhal:
+  ownership of `vehicle/aidl/impl/`; vss: `.vspec`.
+- `prompts/fewshot_localize.md` — called fictional `vendor/oem/...` paths "real AOSP
+  paths", showed `needs_human_review` / draft-patch output that code decides, and used the
+  deprecated `registerCallback`. Rewritten as format-only examples, plus a unit-mismatch
+  example (km/h vs m/s).
+- `requirements.txt` — dropped unused `langchain`, `langchain-community`.
+- README: forced-review list matches code (no "projection"), Colab backend named.
+- Unused imports removed (`agent/specialists.py`, `agent/tools_def.py`).
+
+Still open: the requirement → code workflow in `agent/nodes.py` is not wired into the
+graph; `CompositeStore.manifest()` returns only the base manifest, so ripgrep uses base
+scope roots for customer tenants.
+
+# Update 35 — One schema for demo input, labels and eval
+
+The demo input, the example labels and the eval did not match:
+- `eval/labels.example.jsonl` held two "labels" whose gold files (`vendor/oem/...`) do not
+  exist in any indexed tree (AOSP + COVESA under `vendor/vss`), so they could never be hit;
+  bug-002 was also literally few-shot Example 2 (answer in the prompt). Now a single
+  placeholder line documenting the schema.
+- `data/sample_bug.json` used a different schema (`bug_report`, `stack`) and nothing read
+  it. Now the label schema (`bug`, `logcat_file`) and runnable with
+  `python -m agent.main --bug-file data/sample_bug.json`; dropped the unused `stack` and the
+  claim "Customer mapping present under vendor/" (not true for the Colab tree).
+- `eval/run_eval.py` passed `logcat` as raw text only, while demos pass a logcat file. Both
+  now go through `agent.main.resolve_logcat`: `logcat` (inline) or `logcat_file` (relative
+  to the label file, then the repo root), `#` lines dropped.
+- `run_eval` checks every gold file against `--aosp-root`, warns per item, stores
+  `gold_missing_in_tree` per row and `n_gold_missing_in_tree` in the summary.
+- `agent/main.py` gains `--bug-file` (JSON or one-line JSONL record, label schema; accepts
+  legacy `bug_report`).
+

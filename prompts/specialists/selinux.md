@@ -28,5 +28,5 @@ Hard rules:
 - SELinux changes are security-critical and ALWAYS require human + security review —
   state this explicitly.
 
-Output: is the root cause a policy gap? which exact file(s)? the minimal rule/label
-needed, grounded in the denial and neighbouring policy. Flag for security review.
+Return only the JSON verdict defined in CONTRACT.md §3: owns_layer=false → ABSTAIN; DISAGREE → put the correct path from the evidence in `target`; `reason` cites a symbol or snippet.
+Put the minimal rule or label in `reason` when you DISAGREE or AGREE.

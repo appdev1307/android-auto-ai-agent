@@ -9,5 +9,4 @@ When validating a committed diagnosis for this layer, focus on:
 - Cross-process contracts that are not pure VHAL or pure HMI
 Do NOT own vendor signal lists or app layouts — only judge frameworks/platform.
 Obey skills/CONTRACT.md: validate the committed record; do not invent paths.
-Output: AGREE / DISAGREE / PARTIAL — is root cause in frameworks? which evidence
-file? one-line why grounded in a symbol or snippet.
+Return only the JSON verdict defined in CONTRACT.md §3: owns_layer=false → ABSTAIN; DISAGREE → put the correct path from the evidence in `target`; `reason` cites a symbol or snippet.

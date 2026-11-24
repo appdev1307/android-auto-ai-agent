@@ -16,8 +16,8 @@ Not a prompt-only skeleton. Includes:
 - Tools: `hybrid_search`, `read_source`, `lookup_vss_signal`, `find_aidl_interface`, `find_symbol`
 - ReAct tool loop (LangGraph) → **committed diagnosis** → **vertical specialists** (≤5) + consensus → finalize
 - Patch grounded on the real file (apply + tree-sitter parse oracle) + AAOS-native UT ideas
-- Forced human-review on VHAL / VSS / AIDL / SELinux / power / binder / projection seams
-- OpenAI-compatible LLM backend (vLLM on server, **Ollama on Colab**)
+- Forced human-review on VHAL / VSS / AIDL / binder / native / SELinux / power / frameworks layers
+- OpenAI-compatible LLM backend (vLLM on server, **Ollama `qwen2.5-coder:32b` on Colab**)
 
 ---
 
@@ -73,7 +73,7 @@ python -m retrieval.indexer --aosp-root $AOSP_ROOT --base --aosp-version aosp15 
 **Server / workstation (vLLM example):**
 
 ```bash
-bash scripts/start_vllm.sh        # Qwen/Qwen2.5-Coder-32B-Instruct, max_len 32768
+bash scripts/start_vllm.sh        # Qwen2.5-Coder-32B-Instruct-AWQ, served as model.name, tool calling on, 32k
 export OPENAI_API_BASE=http://127.0.0.1:8000/v1
 export OPENAI_API_KEY=dummy
 ```
@@ -94,6 +94,9 @@ Python. Point `data/config.yaml` `model.api_base` at that endpoint (the notebook
 python -m agent.main --aosp-root $AOSP_ROOT --aosp-version aosp15 \
   --bug "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON"
 ```
+
+`--logcat` drops lines starting with `#`: the `test_data/*.logcat` fixtures carry `# BUG:` /
+`# LAYER:` answer headers that must not reach the agent.
 
 Output: committed diagnosis (file / layer / symbols), specialist verdicts + consensus,
 ranked evidence, a **grounded** unified diff when the source file was read (or N/A),
@@ -212,11 +215,21 @@ Hints steer reasoning; they do not replace retrieval.
 ## Evaluation (labeled)
 
 Measure the agent instead of guessing. You provide labels (bug → gold files); the harness
-runs the agent and scores it. Label file is JSONL — see `eval/labels.example.jsonl`:
+runs the agent and scores it. One schema is used everywhere — eval labels, `eval/mine_labels.py`
+output, and `python -m agent.main --bug-file <record.json>` (e.g. `data/sample_bug.json`):
 
 ```json
-{"id":"bug-001","bug":"...","gold_files":["path/a.java","path/b.yaml"],"gold_diff_files":["path/a.java"]}
+{"id":"...","bug":"<symptom, no file names>","logcat_file":"test_data/<f>.logcat","gold_files":["<path under --aosp-root>"],"gold_diff_files":["<subset>"]}
 ```
+
+- `eval/labels.example.jsonl` shows the schema with placeholders only; it is not a dataset.
+  Real labels: `eval/mine_labels.py` (AOSP fix commits) or your own OEM fix commits.
+- `logcat` (inline text) or `logcat_file` (relative to the label file, then the repo root);
+  `#` lines are dropped in both.
+- Gold paths are relative to the **indexed** tree. `run_eval` warns for every gold file not
+  found under `--aosp-root` and reports `n_gold_missing_in_tree` — such items cannot be hit.
+- `test_data/*.logcat` are synthetic demo fixtures with no gold labels; they are for
+  `agent.main` demos, not for scoring.
 
 Run:
 
@@ -293,7 +306,7 @@ Bug/logcat
   → agent (LLM + tools)  ⇄  tools (ToolNode)     # ReAct loop
   → commit_diagnosis      # single source of truth (file/layer/symbols)
   → specialists (≤ agent.max_specialists, default 5)
-       + horizontal skill injection + VERDICT consensus (≤ agent.max_debate_rounds)
+       + horizontal skill injection + JSON-verdict consensus (≤ agent.max_debate_rounds)
   → relocalize (once, only if owning specialists reject the target)
        → commit again if it found new candidates, else finalize
   → finalize (render diagnosis, grounded patch on the enclosing AST node, UT, human-review)

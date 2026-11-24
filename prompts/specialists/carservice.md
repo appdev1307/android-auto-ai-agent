@@ -7,4 +7,4 @@ Focus on:
 - Permission checks: does the call require a permission that's missing/denied?
 - The bridge to VHAL: does CarService actually subscribe to the HAL property?
 Do NOT judge VHAL C++ internals or HMI — only the CarService side.
-Output: is the root cause likely in CarService? which exact file(s)? one-line why, grounded in a snippet.
+Return only the JSON verdict defined in CONTRACT.md §3: owns_layer=false → ABSTAIN; DISAGREE → put the correct path from the evidence in `target`; `reason` cites a symbol or snippet.
