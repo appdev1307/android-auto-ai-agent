@@ -838,3 +838,48 @@ The demo input, the example labels and the eval did not match:
 - `agent/main.py` gains `--bug-file` (JSON or one-line JSONL record, label schema; accepts
   legacy `bug_report`).
 
+
+# Update 36 — Human gate with acceptance criteria [XK-n] + checkpoint / resume
+
+Ideas taken from a skill-based Claude Code workflow (STOP gate after analysis, `[XK-n]`
+criteria fixed before any code, run folder with verbatim inputs + `--resume`), rebuilt
+here as LangGraph mechanics instead of prompt text.
+
+Flow: `… → specialists → (relocalize) → criteria → [HUMAN GATE] → finalize → END`.
+
+- New node `criteria` (`agent/nodes.py propose_criteria`, logic in `agent/criteria.py`):
+  the LLM proposes 2–5 checkable criteria (`log|property|screen|unit|manual`) for the
+  committed diagnosis. Deterministic cleanup: vague items ("works", "fixed") dropped, ids
+  renumbered `XK-1..n`, identifiers not seen in the run's evidence flagged
+  (`⚠ not seen in this run's evidence`). No fallback invention; skipped on a refuted target.
+- Gate = `compile(interrupt_before=["finalize"])` + `SqliteSaver` at
+  `runs/<id>/checkpoint.sqlite`. **On by default for a single CLI run**; `--no-gate`,
+  `--interactive` and `eval/run_eval.py` run straight through.
+- At the gate the CLI writes `runs/<id>/analysis.md` (committed diagnosis, consensus,
+  `[XK-n]`, Source map ≤ 10 lines, `Next:`) and `runs/<id>/inputs.md` (bug, files, tenant
+  — verbatim), prints the resume commands and exits.
+- `python -m agent.main --resume <id>` with exactly one of
+  `--approve` · `--criteria-file FILE` (one per line, optional `kind:` prefix — replaces the
+  proposed set, user wording kept) · `--reject "reason"`; optional `--note "…"`.
+  Every gate input is appended verbatim to `inputs.md`. The retriever is rebuilt from the
+  stored `aosp_root` / `tenant` before finalize (it is process memory, not checkpointed).
+- `finalize`: on reject → no patch, no unit test, `status=rejected_by_user`,
+  `needs_human_review=True`. Otherwise renders `## Acceptance criteria (approved at the
+  gate | proposed — NOT reviewed: gate off)` and passes the criteria + note into the
+  patch and unit-test prompts; the UT prompt maps each `unit` criterion to a test citing
+  its id and may not add / drop / reword criteria. Result also saved to `runs/<id>/result.md`.
+- Same `--run-id` again starts over (old run files replaced). Resuming a finished run or
+  an unknown id exits with a message.
+- `recursion_limit` 25 → 40 (main + eval): 2 + 2×`max_tool_iters` + re-localize passes +
+  criteria + finalize could already exceed 25.
+- `_UT_PROMPT` pointed to `skills/patch_and_ut.md`; the file is `skills/20-patch_and_ut.md`.
+- `requirements.txt`: `langgraph-checkpoint-sqlite>=2.0`. `.gitignore`: `runs/` (inputs.md
+  holds user text / possibly customer details).
+- Notebook: bug 01 runs gated with `--runs-dir {DRIVE}/runs --run-id bug01` (survives a
+  runtime restart) + new cell 5b to resume; bugs 02–05 `--no-gate`.
+
+Tested with the fake-LLM smoke harness: gate stop → analysis/inputs written; resume
+approve (criteria + note reach patch and UT prompts); `--criteria-file`; `--reject`
+(0 LLM calls, no patch); resume of a finished run refused; same run id restarts;
+refuted target → no criteria; `--no-gate` unchanged output plus the criteria block.
+Not tested on a real model / GPU.

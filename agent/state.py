@@ -26,3 +26,6 @@ class AgentState(TypedDict):
     specialist_notes: list
     specialist_rounds: int              # ReConcile-style debate rounds actually run
     specialist_consensus: Dict[str, Any]  # majority verdict + force_human_review
+    criteria: List[Dict[str, Any]]      # [XK-n] acceptance criteria (proposed -> fixed at the gate)
+    user_decision: str                  # "" | "approve" | "reject"  (set on --resume)
+    user_notes: str                     # user text at the gate, verbatim (reason / constraints)

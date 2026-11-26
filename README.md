@@ -95,6 +95,19 @@ python -m agent.main --aosp-root $AOSP_ROOT --aosp-version aosp15 \
   --bug "Android 15: VSS Vehicle.Speed not updating in HMI after ignition ON"
 ```
 
+A single run **stops at the human gate** before the patch: it prints and writes
+`runs/<id>/analysis.md` (committed diagnosis, specialist consensus, proposed acceptance
+criteria `[XK-n]`, source map) and `runs/<id>/inputs.md` (your inputs, verbatim). Continue:
+
+```bash
+python -m agent.main --resume <id> --approve [--note "keep the public API unchanged"]
+python -m agent.main --resume <id> --criteria-file my_xk.txt   # one per line, `unit: …`, `log: …`
+python -m agent.main --resume <id> --reject "wrong layer"       # no patch, no unit test
+```
+
+State lives in `runs/<id>/checkpoint.sqlite` (LangGraph `SqliteSaver`), so `--resume` works
+from a new process. `--no-gate` runs straight through (batch / CI); eval never gates.
+
 `--logcat` drops lines starting with `#`: the `test_data/*.logcat` fixtures carry `# BUG:` /
 `# LAYER:` answer headers that must not reach the agent.
 
@@ -309,7 +322,10 @@ Bug/logcat
        + horizontal skill injection + JSON-verdict consensus (≤ agent.max_debate_rounds)
   → relocalize (once, only if owning specialists reject the target)
        → commit again if it found new candidates, else finalize
-  → finalize (render diagnosis, grounded patch on the enclosing AST node, UT, human-review)
+  → criteria              # 2–5 checkable [XK-n] for the committed diagnosis
+  ── HUMAN GATE ──         # interrupt_before finalize; approve / replace criteria / reject
+  → finalize (render diagnosis + approved [XK-n], grounded patch on the enclosing AST node,
+              UT bound to the criteria, human-review)
 ```
 
 Vertical specialists (examples): `vhal`, `aidl`, `binder`, `carservice`, `hmi`, `vss`,

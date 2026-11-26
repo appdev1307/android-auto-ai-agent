@@ -13,6 +13,8 @@ from langgraph.prebuilt import ToolNode
 
 from agent.state import AgentState
 from agent.tools_def import ALL_TOOLS, set_retriever, get_retriever
+from agent.criteria import (PROMPT as CRITERIA_PROMPT, parse_criteria, validate_criteria,
+                            render_criteria)
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
 from retrieval.chunker import (apply_unified_diff, parse_ok, grammar_missing, guess_layer,
@@ -727,7 +729,7 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
                         "after retries: " + (last_err or "") + " Verify on a real build.")
 
 
-_UT_PROMPT = """Finalize. No more tools. Follow skills/patch_and_ut.md.
+_UT_PROMPT = """Finalize. No more tools. Follow skills/20-patch_and_ut.md.
 
 The diagnosis is ALREADY COMMITTED (below). Do NOT restate candidates or root
 cause, do NOT change the target file, and do NOT write a unified diff (the patch
@@ -749,6 +751,9 @@ Bind the test to the COMMITTED symbols / property_ids below and reference ONLY
 names that appear in them or in the target file excerpt — do NOT invent API,
 class names, or methods. If a needed symbol is missing from the evidence, use the
 closest committed symbol instead of inventing one.
+If acceptance criteria [XK-n] are given above, each `unit` criterion must map to one
+@Test / TEST_F whose name or comment cites its id (e.g. `// XK-2`). Do not add, drop or
+reword a criterion; if one cannot be expressed as a unit test, leave it to QC.
 """
 
 ALWAYS_REVIEW_LAYERS = {"native", "vhal", "vss", "aidl", "hidl_legacy", "selinux", "binder", "startup_power", "frameworks"}
@@ -765,6 +770,26 @@ def finalize(state: AgentState) -> Dict[str, Any]:
     if state.get("workflow") == "requirement":
         return _finalize_requirement(state)
     dx = state.get("diagnosis") or {}
+    crit = state.get("criteria") or []
+    decision = state.get("user_decision") or ""
+    if decision == "reject":
+        # Human gate said no: render what was localized + the reason, write nothing.
+        reason = state.get("user_notes") or "(no reason given)"
+        text = (render_diagnosis(dx) + "\n\n" + render_criteria(crit, None)
+                + "\n\n## Rejected at the human gate\n" + reason
+                + "\n\nNo patch and no unit test were generated.")
+        return {"messages": [AIMessage(content=text)], "status": "rejected_by_user",
+                "needs_human_review": True,
+                "root_cause": dx.get("root_cause") or "",
+                "candidate_files": [c["path"] for c in dx.get("candidates", []) or []]}
+    approved = True if decision == "approve" else False
+    notes = state.get("user_notes") or ""
+    crit_block = ""
+    if crit:
+        crit_block = "\n\nAcceptance criteria (fixed at the gate — do not change):\n" + \
+            "\n".join(f"- [{c['id']}] ({c['kind']}) {c['check']}" for c in crit)
+    if notes:
+        crit_block += "\n\nUser constraints (verbatim):\n" + notes
     r = get_retriever()
     needs_review = bool(state.get("needs_human_review"))
     consensus = state.get("specialist_consensus") or {}
@@ -810,6 +835,8 @@ def finalize(state: AgentState) -> Dict[str, Any]:
         state.get("specialist_notes") or [], consensus=consensus
     )
     text += spec_notes
+    if not rejected:  # nothing to accept on a refuted target
+        text += "\n\n" + render_criteria(crit, approved)
 
     if rejected:
         # The rendered root cause above is the REJECTED committed hypothesis — say so
@@ -853,7 +880,7 @@ def finalize(state: AgentState) -> Dict[str, Any]:
                  f"- layer: {dx.get('layer')}\n"
                  f"- symbols: {', '.join(dx.get('symbols') or []) or '(none)'}\n"
                  f"- property_ids: {', '.join(dx.get('property_ids') or []) or '(none)'}\n"
-                 f"- root_cause: {dx.get('root_cause')}\n\n"
+                 f"- root_cause: {dx.get('root_cause')}{crit_block}\n\n"
                  f"Target file excerpt (reference REAL API from here — do not invent):\n"
                  f"{ut_excerpt or '(not available)'}")
         try:
@@ -924,7 +951,7 @@ def finalize(state: AgentState) -> Dict[str, Any]:
                     offset = full[:pos].count("\n") if pos > 0 else 0
                 patch_text, syntax_note = _grounded_patch_loop(
                     window, target, state.get("bug_report", ""),
-                    dx.get("root_cause", ""), truncated=windowed,
+                    (dx.get("root_cause", "") or "") + crit_block, truncated=windowed,
                     fragment=bool(node))
                 # diff was made against the region -> report real file line numbers
                 patch_text = _offset_hunks(patch_text, offset)
@@ -985,6 +1012,47 @@ def finalize(state: AgentState) -> Dict[str, Any]:
         "root_cause": dx.get("root_cause") or text[:2000],
         "candidate_files": [c["path"] for c in dx.get("candidates", []) or []],
     }
+
+
+def propose_criteria(state: AgentState) -> Dict[str, Any]:
+    """Propose 2-5 acceptance criteria [XK-n] for the committed diagnosis.
+
+    Runs once, after the specialists settle and before the (optionally gated)
+    finalize. Output is validated deterministically (agent/criteria.py): vague
+    items dropped, ids renumbered, identifiers not seen in the run flagged. No
+    fallback invention — an empty list means the user gives them at the gate.
+    Skipped when the target was rejected (nothing to accept) or criteria already
+    exist (e.g. supplied by the user on --resume).
+    """
+    if state.get("workflow") == "requirement" or state.get("criteria"):
+        return {}
+    dx = state.get("diagnosis") or {}
+    if not dx.get("file") or (state.get("specialist_consensus") or {}).get("reject_committed"):
+        return {"criteria": []}
+    ev = collect_evidence(state.get("messages") or [])
+    r = get_retriever()
+    excerpt = ""
+    if r is not None:
+        try:
+            excerpt = r.read_file(dx["file"], max_chars=4000)
+        except Exception:
+            excerpt = ""
+    facts = (f"Bug:\n{state.get('bug_report', '')}\n\n"
+             f"Committed diagnosis:\n- file: {dx.get('file')}\n- layer: {dx.get('layer')}\n"
+             f"- symbols: {', '.join(dx.get('symbols') or []) or '(none)'}\n"
+             f"- property_ids: {', '.join(dx.get('property_ids') or []) or '(none)'}\n"
+             f"- root_cause: {dx.get('root_cause')}\n\n"
+             f"Target file excerpt:\n{excerpt or '(not available)'}")
+    try:
+        resp = llm.invoke([SystemMessage(content=SYSTEM), HumanMessage(content=facts),
+                           HumanMessage(content=CRITERIA_PROMPT)])
+        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+    except Exception:
+        raw = ""
+    grounding = "\n".join([ev.get("corpus") or "", excerpt, state.get("bug_report") or "",
+                           state.get("logcat_snippet") or "",
+                           " ".join((dx.get("symbols") or []) + (dx.get("property_ids") or []))])
+    return {"criteria": validate_criteria(parse_criteria(raw), grounding)}
 
 
 # Multi-agent per-layer specialists (built once, reuse shared llm + active retriever)

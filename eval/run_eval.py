@@ -83,9 +83,10 @@ def run_one(graph, rec: dict, aosp_root, tenant, k: int, labels_dir=None) -> dic
         # same seed as agent/main.py: review is raised by real triggers only
         "needs_human_review": False, "iterations": 0,
         "relocalize_count": 0, "specialist_notes": [],
+        "criteria": [], "user_decision": "", "user_notes": "",
     }
     try:
-        result = graph.invoke(state, config={"recursion_limit": 25})
+        result = graph.invoke(state, config={"recursion_limit": 40})
     except Exception as e:
         return {"id": rec["id"], "error": str(e)}
 
@@ -145,7 +146,7 @@ def main():
     else:
         print("[eval] WARNING no --aosp-root: gold files not checked against the tree")
 
-    graph = build_graph()
+    graph = build_graph(gate=False)  # eval never stops at the human gate
     labels_dir = Path(args.labels).resolve().parent
     rows = []
     for rec in recs:
