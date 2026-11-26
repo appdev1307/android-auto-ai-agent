@@ -20,6 +20,10 @@ When inspecting evidence for the bug, focus on:
   design is wrong — do not widen policy to force it through.
 
 Hard rules:
+- AIDL HALs (Android 14+): services are labelled in `service_contexts` and use
+  `add_service` / `hal_attribute_service`; `hwservice_contexts`, `add_hwservice`,
+  `hal_attribute_hwservice`, `hwbinder_use` are HIDL — never in a new rule.
+- No `permissive` domains.
 - Propose the **smallest** rule that resolves the specific denial. Never broaden
   (no wildcard domains/types/permissions, no `allow { domain } { ... }:* *`).
 - Never invent a domain, type, or macro that isn't in the evidence.

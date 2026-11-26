@@ -43,7 +43,15 @@ def read_source(path: str) -> str:
     """Read a source file (truncated). Path from hybrid_search results."""
     if not _retriever:
         return "Retriever not initialized"
-    return _retriever.read_file(path)
+    text = _retriever.read_file(path)
+    if not text.startswith(("[error", "[refused")):
+        from retrieval.chunker import is_hidl
+        if is_hidl(path, text):
+            return ("[LEGACY HIDL FILE — Android 14+ AAOS HALs are AIDL "
+                    "(VHAL: hardware/interfaces/automotive/vehicle/aidl/). Do not localize to or "
+                    "patch this file unless the bug is explicitly about the HIDL path; look for "
+                    "the AIDL implementation instead.]\n" + text)
+    return text
 
 
 @tool

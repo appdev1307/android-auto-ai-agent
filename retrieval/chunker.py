@@ -25,22 +25,44 @@ HIDL_PATH_MARKERS = (
 )
 
 
+# HIDL-only CONTENT tokens. Unlike shared identifiers (IVehicle, VehiclePropValue,
+# "vehicle"), none of these can appear in AIDL code: they are HIDL types, HIDL
+# namespaces/packages, HIDL build libs or HIDL-only SELinux macros. That is why a
+# content gate on THESE is safe where the old keyword filter (which matched
+# "ivehicle", "oneway void get", bare "v2_0") dropped the AIDL reference impl.
+# Shared with agent/aosp_rules.py (patch oracle) — one list for RAG and output.
+HIDL_CONTENT_TOKENS = (
+    "hidl_vec<", "hidl_string", "hidl_array<", "HIDL_FETCH_",
+    "::V2_0::", "::V1_0::", "@2.0::", "@1.0::",
+    "#include <hidl/", "android/hardware/automotive/vehicle/2.0/",
+    "android.hardware.automotive.vehicle@2.0", "android.hardware.automotive.vehicle.V2_0",
+    "libhidlbase", "libhidltransport", "libhwbinder", "hidl_interface {",
+    "hal_attribute_hwservice", "add_hwservice(", "find_hwservice(", "hwbinder_use(",
+)
+
+
+def hidl_tokens_in(text: str | None) -> list[str]:
+    """HIDL-only tokens present in `text` (empty list = none)."""
+    if not text:
+        return []
+    return [t for t in HIDL_CONTENT_TOKENS if t in text]
+
+
 def is_hidl(path: str, content: str | None = None) -> bool:
     """True if a file is legacy HIDL.
 
-    Path markers cover AOSP upstream. Vendor/OEM trees can ship a HIDL HAL
-    in a non-standard path, so two extra signals — safe because neither
-    `.hal` nor `hidl_interface {` ever appears in an AIDL file (unlike the
-    shared identifiers a keyword filter would false-positive on):
-      - a `.hal` extension (AIDL uses `.aidl`)
-      - a `hidl_interface { }` Soong module in an Android.bp
+    1. Path markers (AOSP upstream layout: versioned package dirs, /hidl/).
+    2. `.hal` extension (AIDL uses `.aidl`).
+    3. With `content`: any HIDL-only token (HIDL_CONTENT_TOKENS) — catches a
+       vendor/OEM HIDL HAL in a non-standard path, or a HIDL Android.bp /
+       sepolicy file, which path rules miss. Never matches shared identifiers.
     """
     p = path.replace("\\", "/").lower()
     if any(m in p for m in HIDL_PATH_MARKERS):
         return True
     if p.endswith(".hal"):
         return True
-    if p.endswith(".bp") and content and "hidl_interface" in content:
+    if content and hidl_tokens_in(content):
         return True
     return False
 
@@ -666,6 +688,10 @@ def chunk_file(path: Path, chunk_size: int = 1200, overlap: int = 200) -> list[d
     except Exception:
         return []
     if not text.strip():
+        return []
+    # HIDL by content (vendor HIDL HAL outside the versioned dirs): drop at index
+    # time like path-HIDL. Path-HIDL never reaches here (filtered before I/O).
+    if is_hidl(str(path), text):
         return []
 
     # 1. VSS signal-tree chunking for VSS-looking yaml/json

@@ -19,7 +19,7 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import yaml
 
-from retrieval.chunker import guess_layer
+from retrieval.chunker import guess_layer, hidl_tokens_in
 from retrieval.store import Tenant, VectorStore, StoreProvider
 
 
@@ -395,7 +395,11 @@ class HybridRetriever:
             "/2.0/", "/1.0/", "/3.0/", "/4.0/", "/hidl/", "/hidl-generated/",
             "/vehicle/2.0/", "/vehicle/1.0/", "/v2_0/", "/v1_0/", "/v3_0/",
         )
-        q_is_hidl = any(x in q for x in ("hidl", "migrat", "legacy", "v2_0", "2.0", ".hal"))
+        # Bypass ONLY when the query names HIDL explicitly. "2.0" / "legacy" /
+        # "migrat" were also accepted before; bug text and logcat carry those
+        # ("v2.0", "legacy mode") all the time, which let HIDL through on seed
+        # retrieval.
+        q_is_hidl = any(x in q for x in ("hidl", ".hal", "v2_0", "@2.0"))
         kept = []
         for h in hits:
             pl = (h.get("path") or "").replace("\\", "/").lower()
@@ -403,6 +407,7 @@ class HybridRetriever:
                 h.get("layer") == "hidl_legacy"
                 or any(m in pl for m in HIDL_PATH)
                 or pl.endswith(".hal")
+                or bool(hidl_tokens_in(h.get("content")))  # old index / overlay
             )
             if is_hidl_hit and not q_is_hidl:
                 continue  # hard drop

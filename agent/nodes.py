@@ -13,11 +13,13 @@ from langgraph.prebuilt import ToolNode
 
 from agent.state import AgentState
 from agent.tools_def import ALL_TOOLS, set_retriever, get_retriever
+from agent.aosp_rules import (check_patch as check_aosp_patch, check_ut as check_aosp_ut,
+                              prompt_rules)
 from agent.criteria import (PROMPT as CRITERIA_PROMPT, parse_criteria, validate_criteria,
                             render_criteria)
 from retrieval.hybrid import HybridRetriever
 from retrieval.store import Tenant
-from retrieval.chunker import (apply_unified_diff, parse_ok, grammar_missing, guess_layer,
+from retrieval.chunker import (is_hidl, apply_unified_diff, parse_ok, grammar_missing, guess_layer,
                                clang_format_check, symbol_window, read_enclosing_node)
 from agent.specialists import make_specialists_node, format_specialist_notes
 from agent.diagnosis import (collect_evidence, commit_diagnosis_record,
@@ -389,6 +391,7 @@ def commit_diagnosis(state: AgentState) -> Dict[str, Any]:
                       + [HumanMessage(content=_COMMIT_PROMPT)])
     raw = resp.content if isinstance(resp.content, str) else str(resp.content)
     dx = commit_diagnosis_record(raw, evidence, guess_layer)
+    dx = _flag_hidl_target(dx, state)
     # structured evidence for specialists to reuse (no independent re-retrieval)
     ev_records = [{"path": p, "layer": guess_layer(p)} for p in evidence["paths"]]
     return {
@@ -402,6 +405,35 @@ def commit_diagnosis(state: AgentState) -> Dict[str, Any]:
     }
 
 
+
+
+_HIDL_BUG_WORDS = re.compile(r"\bhidl\b|@\d\.\d|\bv2_0\b|\.hal\b|hwbinder|hwservice", re.I)
+
+
+def _flag_hidl_target(dx: dict, state: dict) -> dict:
+    """A committed file that is legacy HIDL (path or content), on a bug that does not
+    talk about HIDL, is almost always a wrong localization on Android 14+ (VHAL is
+    AIDL). Mark it: layer hidl_legacy, grounding problem (=> review), and finalize
+    will not patch it."""
+    f = dx.get("file") or ""
+    if not f:
+        return dx
+    text = ""
+    r = get_retriever()
+    if r is not None and getattr(r, "source_present", False):
+        try:
+            text = r.read_file(f, max_chars=60000, add_marker=False)
+        except Exception:
+            text = ""
+    if not is_hidl(f, text if not text.startswith(("[error", "[refused")) else None):
+        return dx
+    if _HIDL_BUG_WORDS.search((state.get("bug_report") or "") + "\n"
+                              + (state.get("logcat_snippet") or "")):
+        return {**dx, "layer": "hidl_legacy"}
+    probs = list(dx.get("grounding_problems") or [])
+    probs.append(f"committed file {f} is legacy HIDL but the bug does not mention HIDL "
+                 "(Android 14+ VHAL is AIDL)")
+    return {**dx, "layer": "hidl_legacy", "hidl_target": True, "grounding_problems": probs}
 
 
 SENSITIVE = ("vhal", "vss", "selinux", "power", "aidl", "hardware/interfaces", "binder", "startup", "ignition", "resume", "frameworks")
@@ -657,15 +689,23 @@ def _offset_hunks(patch_text: str, offset: int) -> str:
 
 
 def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
-                         truncated: bool = False, fragment: bool = False) -> tuple[str, str]:
+                         truncated: bool = False, fragment: bool = False,
+                         aosp_root: str | None = None):
     """Generate a unified diff, apply it in-memory to the real file, parse-check
     the result with tree-sitter, and on any syntax/apply error feed the concrete
     problem back and regenerate (up to patch_max_tries). This is the C4
     generate→validate→regenerate loop with a REAL parser as the oracle instead
     of regex/LLM guessing.
 
-    Returns (patch_text, note). note is '' when the patch applies cleanly and
-    parses; otherwise it explains the remaining problem (and review is forced).
+    After "applies", the AOSP rule oracle (agent/aosp_rules.py: no HIDL, stable /
+    frozen AIDL, VHAL IVehicleHardware seam, RawPropValues fields, property-ID
+    encoding, NDK backend/version, SELinux) runs on the added / removed lines; an
+    `error` is fed back like a syntax error and the patch is regenerated.
+
+    Returns (patch_text, note, rules_report). note is '' when the patch applies
+    cleanly, parses and passes the rules; otherwise it explains the remaining
+    problem (and review is forced). rules_report is the last aosp_rules.Report
+    (None when no diff was produced).
     """
     from pathlib import Path as _P
     suffix = _P(top).suffix
@@ -674,10 +714,12 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
     trunc = "\n... [file truncated for context] ..." if truncated else ""
     last_err = None
     patch_text = "N/A"
+    rules = None
+    rules_text = prompt_rules(top)
     for _ in range(PATCH_MAX_TRIES + 1):
         instr = (f"Full current content of `{top}` below. Output ONLY a unified diff that "
                  f"applies CLEANLY against this exact file (real context lines, correct path), "
-                 f"or `N/A` if no change is warranted.")
+                 f"or `N/A` if no change is warranted.\n\n{rules_text}")
         if last_err:
             instr += f"\n\nYour previous diff was rejected: {last_err}\nProduce a corrected diff."
         msgs = [
@@ -688,11 +730,18 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
         resp = llm.invoke(msgs)
         patch_text = resp.content if isinstance(resp.content, str) else str(resp.content)
         if "@@" not in patch_text:
-            return patch_text, ""  # model decided no change (N/A)
+            return patch_text, "", None  # model decided no change (N/A)
         diff = _extract_first_diff(patch_text)
         patched = apply_unified_diff(full, diff)
         if patched is None:
             last_err = "the diff did not apply (a hunk's context did not match the file)."
+            continue
+        # AOSP rules on what the diff adds / removes (works on a window too).
+        rules = check_aosp_patch(top, full, patched, diff, aosp_root=aosp_root, bug_text=bug)
+        if rules.errors:
+            last_err = rules.feedback()
+            if any(v.rule == "AIDL-FROZEN" for v in rules.errors):
+                break  # no diff to this file can pass; retrying only burns calls
             continue
         # A truncated file is syntactically incomplete, so parse_ok would always
         # false-fail. If the diff applied to the visible portion, accept it but
@@ -700,7 +749,7 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
         if truncated:
             return patch_text, ("Large file: patch was generated against the "
                                 "symbol-anchored region (not the whole file), so syntax "
-                                "wasn't fully verified — verify on a real build.")
+                                "wasn't fully verified — verify on a real build."), rules
         ok, errs = parse_ok(patched, suffix, fragment=fragment)
         if ok:
             # parse_ok returns ok=True both for "parsed cleanly" and for "no
@@ -709,7 +758,7 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
             if grammar_missing(suffix):
                 return patch_text, (f"Syntax NOT verified: no tree-sitter grammar for "
                                     f"'{suffix}' is installed here, so the parse-check was "
-                                    f"skipped. Install the grammar or verify on a real build.")
+                                    f"skipped. Install the grammar or verify on a real build."), rules
             # Convention gate (C/C++): the added lines must be clang-format clean
             # (AOSP style). On a violation, feed the concrete reformat back and
             # regenerate; if clang-format isn't installed, say style wasn't
@@ -722,11 +771,11 @@ def _grounded_patch_loop(full: str, top: str, bug: str, summary: str,
                 continue
             if cf_status == "unavailable":
                 return patch_text, ("Applies + parses, but C++ style NOT enforced: "
-                                    + cf_probs[0] + " — run clang-format or verify on a real build.")
-            return patch_text, ""  # clean: applies + parses + clang-format clean
+                                    + cf_probs[0] + " — run clang-format or verify on a real build."), rules
+            return patch_text, "", rules  # clean: applies + parses + rules + clang-format
         last_err = "applying it introduces a syntax error — " + "; ".join(errs[:3])
-    return patch_text, ("Generated patch still fails validation (syntax/apply/style) "
-                        "after retries: " + (last_err or "") + " Verify on a real build.")
+    return patch_text, ("Generated patch still fails validation (syntax/apply/AOSP rules/style) "
+                        "after retries: " + (last_err or "") + " Verify on a real build."), rules
 
 
 _UT_PROMPT = """Finalize. No more tools. Follow skills/20-patch_and_ut.md.
@@ -883,14 +932,29 @@ def finalize(state: AgentState) -> Dict[str, Any]:
                  f"- root_cause: {dx.get('root_cause')}{crit_block}\n\n"
                  f"Target file excerpt (reference REAL API from here — do not invent):\n"
                  f"{ut_excerpt or '(not available)'}")
+        ut_rules = prompt_rules(ut_file, for_test=True) if ut_file else ""
+        ut_msgs = [SystemMessage(content=SYSTEM + spec_notes),
+                   HumanMessage(content=facts),
+                   HumanMessage(content=_UT_PROMPT + "\n" + ut_rules)]
+        ut_rep = None
         try:
-            resp = llm.invoke([SystemMessage(content=SYSTEM + spec_notes),
-                               HumanMessage(content=facts),
-                               HumanMessage(content=_UT_PROMPT)])
-            ut_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            # generate -> AOSP/UT rules -> regenerate once with the concrete errors
+            for attempt in range(2):
+                resp = llm.invoke(ut_msgs)
+                ut_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+                ut_rep = check_aosp_ut(ut_text, ut_file, crit) if ut_file else None
+                if not ut_rep or not ut_rep.errors or attempt == 1:
+                    break
+                ut_msgs = ut_msgs + [AIMessage(content=ut_text), HumanMessage(
+                    content="Your test was rejected: " + ut_rep.feedback()
+                            + "\nRewrite the whole ## Unit test section fixing exactly these.")]
         except Exception:
             ut_text = "## Unit test\n_(unit test generation unavailable)_"
+            ut_rep = None
         text += "\n\n" + ut_text
+        if ut_rep is not None and ut_rep.violations:
+            text += "\n\n" + ut_rep.render("Unit-test rules")
+            needs_review = True
 
     # 3) Safety-critical layers ALWAYS require a human — from the committed layers.
     committed_layers = {dx.get("layer", "")} | {c.get("layer", "")
@@ -922,6 +986,13 @@ def finalize(state: AgentState) -> Dict[str, Any]:
         text += ("\n\n## Patch\nNo patch generated — the committed target was rejected "
                  "by the owning specialists (see 'Localization unresolved' above). "
                  "Re-localize to an accepted target before patching.")
+    elif dx.get("hidl_target"):
+        text += ("\n\n## Patch\nNo patch generated — the committed target is a legacy HIDL "
+                 f"file (`{target}`) and the bug does not mention HIDL. Android 14+/AAOS VHAL is "
+                 "AIDL (`hardware/interfaces/automotive/vehicle/aidl/`): re-localize to the AIDL "
+                 "implementation, or re-run with a bug text that names the HIDL path if the "
+                 "HIDL shim really is the target.")
+        needs_review = True
     elif r is not None and dx.get("committed") and target:
         if getattr(r, "source_present", True):
             budget = 24000
@@ -949,14 +1020,23 @@ def finalize(state: AgentState) -> Dict[str, Any]:
                     region = target
                     pos = full.find(window) if windowed else 0
                     offset = full[:pos].count("\n") if pos > 0 else 0
-                patch_text, syntax_note = _grounded_patch_loop(
+                patch_text, syntax_note, rules_rep = _grounded_patch_loop(
                     window, target, state.get("bug_report", ""),
                     (dx.get("root_cause", "") or "") + crit_block, truncated=windowed,
-                    fragment=bool(node))
+                    fragment=bool(node), aosp_root=getattr(r, "aosp_root", None))
                 # diff was made against the region -> report real file line numbers
                 patch_text = _offset_hunks(patch_text, offset)
                 marker = "\n\n## Patch (grounded in " + region + ")\n"
-                if "@@" in patch_text:
+                if rules_rep is not None and rules_rep.errors:
+                    # Never hand over a diff that breaks an AOSP rule (HIDL in AIDL code,
+                    # changed stable AIDL, wrong RawPropValues field, ...): show why.
+                    text += ("\n\n## Patch — rejected by AOSP rules\nThe last generated diff "
+                             "still breaks the rules below after retries, so it is not "
+                             "shown as a patch. Fix by hand along these rules.\n\n"
+                             + rules_rep.render())
+                    needs_review = True
+                    patch_text, syntax_note = "N/A", ""
+                elif "@@" in patch_text:
                     text += marker + patch_text
                     grounded_marker = marker
                     grounded_source = window
@@ -967,6 +1047,10 @@ def finalize(state: AgentState) -> Dict[str, Any]:
                 if syntax_note:
                     text += "\n\n> ⚠ " + syntax_note
                     needs_review = True
+                if rules_rep is not None and not rules_rep.errors and "@@" in patch_text:
+                    text += "\n\n" + rules_rep.render()
+                    if rules_rep.warns:
+                        needs_review = True
         else:
             text += "\n\n> ⚠ Patch not grounded: source folder not mounted " \
                     "(index-only mode) — verify manually."

@@ -26,6 +26,26 @@
   `UNKNOWN_TRANSACTION`, which must be handled. [S2]
 - Customer coding standards (MISRA, AUTOSAR, …) apply only when a `hints/` file says so.
 
+## AOSP rules the code enforces (`agent/aosp_rules.py`; error = patch regenerated)
+| Rule | What is rejected | Source |
+|---|---|---|
+| HIDL-NEW | HIDL in new code: `hidl_vec`, `hidl_string`, `Return<>`, `HIDL_FETCH_`, `::V2_0::`, `@2.0`, `<hidl/…>`, `libhidlbase`/`libhwbinder`, `*_hwservice` macros, edits to `hwservice_contexts` (exempt when the edited file is itself HIDL) | [S6] |
+| AIDL-FROZEN | any edit under `aidl_api/<name>/<N>/` | [S2] |
+| AIDL-STABLE-CHANGE / -APPEND | in a stable (`@VintfStability` / `hardware/interfaces`) AIDL: removing, retyping or re-valuing an existing method / field / enum constant; a new interface method or parcelable field not at the end | [S2] |
+| VHAL-PROPID | property ID that is not `index + VehiclePropertyGroup + VehicleArea + VehiclePropertyType`, or whose comment names a different type than the bits | [S7] |
+| VHAL-RAWVALUES | `booleanValues` / `boolValues` (no such field; BOOLEAN = `int32Values` 0/1) | [S7] |
+| VHAL-STUB | `callback({})` in getValues / setValues (drops the requests) | [S5] |
+| VHAL-SEAM | vendor code subclassing `BnVehicle` (vendor implements `IVehicleHardware`; `DefaultVehicleHal` owns binder) | [S5] |
+| NDK-INCLUDES | `<ndk/ScopedAStatus.h>`, `<binder/AServiceManager.h>`, `<aidl/…/IVehicleHardware.h>` (do not exist) | [S5] |
+| VHAL-NDK-BACKEND / -VERSION | vendor VHAL linking `-cpp`/`-java`; a `vehicle-V<N>-ndk` different from the one the module already uses or not in the tree | [S6][S8] |
+| SEPOLICY-PERMISSIVE | `permissive <domain>;` | [S9] |
+| warn: CPP-EXCEPTIONS, CAR-API-CHANGE | `throw`/`try` in a file without exceptions; a changed public car-lib signature | [S1] |
+Unit-test rules: GoogleTest for C++ targets, JUnit4 for Java/Kotlin; no HIDL; a VHAL test
+that talks to the service uses `AServiceManager_waitForService(IVehicle::descriptor +
+"/default")` and `IVhalClient` `getValueSync`/`setValueSync` (results of
+`IVehicle::getValues` arrive through `IVehicleCallback`) [S8]; each `unit` criterion `[XK-n]`
+maps to a test that cites its id.
+
 ## Size and location
 - Only the change the committed root cause needs; no refactors or drive-by cleanups.
 - Patch the `vendor/` / `device/` copy when it overrides the AOSP file.
@@ -38,7 +58,7 @@
 | Car API behaviour with mocked VHAL | instrumentation | `packages/services/Car/tests/carservice_test/` [S3] |
 | Car app / HMI Java or Kotlin | JUnit4 (Robolectric or instrumentation, whichever the app's existing tests use) | next to the app's existing tests |
 | VHAL C++ | GoogleTest + gmock | next to the implementation's existing `test/` dir |
-| VHAL contract on a device | VTS `VtsHalAutomotiveVehicle_TargetTest` [S5] | a `vts/` folder under `hardware/interfaces/automotive/` [S3] |
+| VHAL contract on a device | VTS `VtsHalAutomotiveVehicle_TargetTest` [S5]; client via `IVhalClient` [S8] | a `vts/` folder under `hardware/interfaces/automotive/` [S3] |
 
 Rules:
 - The test must call or observe the symbol the patch changed, by its real name.
@@ -54,4 +74,12 @@ Rules:
 - [S2] https://source.android.com/docs/core/architecture/aidl/stable-aidl-apis
 - [S3] `packages/services/Car/tests/README.md` (AOSP): test directory roles and priorities
 - [S4] AOSP commit becef5b6c5 "Use mocked Car in CarPropertyManagerUnitTest" (`Test: atest CarServiceUnitTest`)
-- [S5] https://source.android.com/docs/automotive/vhal/vhal_debug
+- [S5] https://source.android.com/docs/automotive/vhal/vhal_debug ; AOSP
+  `hardware/interfaces/automotive/vehicle/aidl/impl/` (`IVehicleHardware.h`, `DefaultVehicleHal`)
+- [S6] https://source.android.com/docs/core/architecture/aidl/aidl-hals
+- [S7] AOSP `hardware/interfaces/automotive/vehicle/aidl/android/hardware/automotive/vehicle/`
+  `VehiclePropertyGroup.aidl`, `VehicleArea.aidl`, `VehiclePropertyType.aidl`, `RawPropValues.aidl`
+- [S8] VHAL codegen pipeline C5 (`multi_main_c5.py`, appdev1307/code-codegen-aosp-llm-based): VTS via
+  `IVhalClient`; the `-V<N>-ndk` lib must match the service on the device (V4 on a V3 device fails
+  with "CANNOT LINK EXECUTABLE … V4-ndk.so not found")
+- [S9] https://source.android.com/docs/security/features/selinux

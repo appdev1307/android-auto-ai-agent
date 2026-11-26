@@ -367,6 +367,25 @@ Four layers wired through `AgentState`: **graph** (LangGraph), **tools**
   deleted/shrunk files left next to a freshly written BM25 corpus).
 - Manifest records `embed_model`, `git_sha` / `git_shas`, and `index_roots`/`scope`.
 
+### AOSP rule oracle (`agent/aosp_rules.py`)
+After a patch applies, deterministic rules run on the lines it adds / removes; an error
+is fed back and the patch regenerated (like the syntax oracle), and the same rules are
+written into the patch and unit-test prompts. A patch that still breaks a rule after
+retries is **not shown as a patch** (`## Patch — rejected by AOSP rules`).
+- no HIDL in new code (exempt only when the edited file is itself HIDL); never edit
+  `aidl_api/<name>/<N>/`; stable AIDL: additions at the end only, no changed values;
+- VHAL: `IVehicleHardware` seam (no `BnVehicle`), real `RawPropValues` fields, no
+  `callback({})`, property ID bits = group | area | type and matching the comment,
+  NDK includes, `-V<N>-ndk` backend with the module's existing `<N>`;
+- SELinux: no `permissive`, no `*_hwservice`; warn: C++ exceptions, car-lib API change.
+- Unit test: GoogleTest for C++, JUnit4 for Java/Kotlin, no HIDL, VHAL service tests via
+  `AServiceManager_waitForService` + `IVhalClient`; each `unit` `[XK-n]` cited. One retry.
+HIDL is also kept out of retrieval: path + `.hal` + HIDL-only content tokens at index time
+and on every hit; the bypass opens only when the query says `hidl` / `.hal` / `v2_0` /
+`@2.0`. `read_source` marks HIDL files; a committed HIDL target on a bug that doesn't
+mention HIDL is flagged and not patched. Rule table + sources: `skills/20-patch_and_ut.md`.
+Tests: `python tests/test_aosp_rules.py`.
+
 ### Tools (`agent/tools_def.py`)
 
 | Tool | Role |

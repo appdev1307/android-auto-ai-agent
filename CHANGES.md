@@ -883,3 +883,63 @@ approve (criteria + note reach patch and UT prompts); `--criteria-file`; `--reje
 (0 LLM calls, no patch); resume of a finished run refused; same run id restarts;
 refuted target → no criteria; `--no-gate` unchanged output plus the criteria block.
 Not tested on a real model / GPU.
+
+# Update 37 — AIDL-only enforcement + AOSP rule oracle for patch and unit test
+
+Checked against the VHAL codegen repo (`appdev1307/code-codegen-aosp-llm-based`):
+`rag/aosp_indexer.py` / `rag/aosp_retriever.py` (path-only HIDL gate, content keywords
+disabled because they dropped AIDL), `agents/rag_dspy_mixin.py` (`_HIDL_CONTAMINATION_PATTERNS`),
+`dspy_opt/validators.py` (cpp / selinux / bp hard fails), `agents/rag_dspy_cpp_agent.py` and
+`dspy_opt/hal_signatures.py` (FORBIDDEN lists), `multi_main_c5.py` (C5 VTS: `IVhalClient`,
+`-V<N>-ndk` must match the device).
+
+Retrieval (HIDL out of RAG)
+- `retrieval/chunker.py`: `HIDL_CONTENT_TOKENS` — only tokens that cannot occur in AIDL code
+  (`hidl_vec<`, `hidl_string`, `HIDL_FETCH_`, `::V2_0::`, `@2.0::`, `<hidl/`, `…vehicle/2.0/`,
+  `…vehicle.V2_0`, `libhidlbase`, `libhwbinder`, `hidl_interface {`, `*_hwservice` macros). Not
+  the thesis' old keyword list (`ivehicle`, bare `v2_0`) that dropped the AIDL reference impl.
+  `is_hidl(path, content)` uses them; `chunk_file` drops content-HIDL files at index time
+  (vendor HIDL HAL outside the versioned dirs). Rebuild the index to apply.
+- `retrieval/hybrid.py:398`: the HIDL bypass opened on `"2.0"`, `"legacy"`, `"migrat"` in the
+  query — bug text / logcat carry those, so seed retrieval let HIDL through. Now only `hidl`,
+  `.hal`, `v2_0`, `@2.0`. Stage 2 also drops hits whose content has a HIDL token (old index).
+- `agent/tools_def.py read_source`: HIDL file → content prefixed with a LEGACY HIDL warning.
+- `agent/nodes.py _flag_hidl_target` (in commit): committed file is HIDL (path or content) and
+  the bug / logcat do not mention HIDL → layer `hidl_legacy`, grounding problem (review),
+  `finalize` does not patch it and says to re-localize to the AIDL impl.
+
+Rule oracle (`agent/aosp_rules.py`, new)
+- Patch: runs after "applies" in `_grounded_patch_loop` on the added / removed lines; `error`
+  → fed back + regenerate (also for windowed / large files, where parse is skipped);
+  `AIDL-FROZEN` stops retries. Rules: HIDL-NEW, AIDL-FROZEN, AIDL-STABLE-CHANGE (removed /
+  retyped declaration, changed or removed enum value — multi-line VehicleProperty constants
+  compared by name), AIDL-STABLE-APPEND, VHAL-PROPID (sum / literal must decode to valid
+  group|area|type; comment `VehiclePropertyType.X` must match the bits), VHAL-RAWVALUES,
+  VHAL-STUB, VHAL-SEAM, NDK-INCLUDES, VHAL-NDK-BACKEND, VHAL-NDK-VERSION (vs the module's
+  existing `<N>` and the tree's `aidl_api/…/<N>` dirs), SEPOLICY-PERMISSIVE, `hwservice_contexts`
+  edits; warn: CPP-EXCEPTIONS, CAR-API-CHANGE.
+- A patch still failing after retries is not rendered as a patch: `## Patch — rejected by
+  AOSP rules` + the report; review forced. A passing patch shows `## AOSP rules (n checked)`.
+- Unit test: UT-HIDL, UT-FRAMEWORK (GoogleTest for C++ targets, JUnit4 for Java/Kotlin),
+  UT-VHAL-CLIENT (warn: `AServiceManager_getService`, raw `IVehicle::getValues` without a
+  callback — use `waitForService` + `IVhalClient`, as C5 / AOSP VTS), RawPropValues fields,
+  UT-CRITERIA (warn: `unit` `[XK-n]` not cited). One regeneration with the errors.
+- `prompt_rules(path)` puts the same rules (per file kind / VHAL path) into the patch and
+  unit-test prompts.
+
+Prompts / skills
+- `prompts/system.md`: rule 4a (AIDL only, frozen / stable AIDL); removed "MISRA C++ /
+  AUTOSAR C++14" for native code (contradicted `skills/20-patch_and_ut.md`: customer standards
+  only via `hints/`).
+- `prompts/specialists/vhal.md` (AIDL impl seam, HIDL target → DISAGREE, RawPropValues),
+  `native.md` (`libbinder_ndk` + `-V<N>-ndk` for vendor AIDL HALs, no HIDL libs; was
+  "e.g. `libbinder`"), `selinux.md` (no hwservice / permissive for AIDL HALs).
+- `skills/20-patch_and_ut.md`: table of enforced rules with sources [S5]–[S9].
+
+Tests: `tests/test_aosp_rules.py` (14 cases, all pass); smoke: HIDL patch → feedback →
+clean patch; HIDL patch every time → "rejected by AOSP rules"; wrong UT framework →
+regenerated; content-HIDL vendor file dropped at index, kept AIDL; `"v2.0 legacy"` query
+no longer bypasses; gate / resume / indexer unchanged. Not run on a real model or build.
+Known limits: rules see the diff, not the whole build (no Soong / aidl tool / checkpolicy);
+VHAL-PROPID needs the ID written as a literal or `+` sum; value-field vs property-type of
+existing properties (e.g. FLOAT filled via int32Values) is left to the vhal specialist.

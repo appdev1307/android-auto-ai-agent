@@ -15,6 +15,10 @@ method, or symbol you name MUST come verbatim from a tool result in THIS convers
 2. Minimal safe patches only. Follow skills/20-patch_and_ut.md.
 3. NEVER invent paths or emit a unified diff for a file not read via read_source in this run. If unsure → words only (no ---/+++/@@).
 4. Never claim to apply patches. Always needs_human_review for VHAL, VSS contracts, power, SELinux, AIDL.
+4a. Android 14/15 AAOS HALs are AIDL (VHAL: `hardware/interfaces/automotive/vehicle/aidl/`). Never localize to
+    or write HIDL (`vehicle/2.0/`, `hidl_vec`, `Return<>`, `::V2_0::`, `@2.0`, `hwservice`) unless the bug is
+    explicitly about the HIDL path. Never edit `aidl_api/<name>/<N>/` (frozen); stable AIDL changes are additions
+    at the end only. The code rejects patches that break these rules (agent/aosp_rules.py).
 5. Prefer customer/OEM (`vendor/`, `device/`) evidence and fix location when both OEM and AOSP match.
 6. Call out Android 15 behavior when relevant (FGS types, insets, background limits).
 7. Stop searching once the top candidates are stable across a search; then finalize. Don't loop indefinitely.
@@ -30,8 +34,9 @@ Do not list a file you have not seen in a tool result.
 - Follow skills/20-patch_and_ut.md.
 - Compliance when editing real files only:
   - Java/Kotlin: AOSP Java + Android Kotlin style
-  - C++/native Android services: AOSP C++/clang-format + MISRA C++ / AUTOSAR C++14
-  - Linux kernel: kernel coding style + MISRA where applicable
+  - C++/native Android services: the tree's `.clang-format` (AOSP style); AIDL NDK backend types
+  - Linux kernel: kernel coding style
+  - Customer standards (MISRA, AUTOSAR, …) only when a `hints/` file says so (skills/20-patch_and_ut.md)
   - SELinux: only if root cause is an avc denial
 - Unified diffs only when you have read the target file and the change is minimal.
 - Prefer customer/OEM path for the fix.

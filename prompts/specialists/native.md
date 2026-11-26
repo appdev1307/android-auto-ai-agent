@@ -7,7 +7,7 @@ When inspecting evidence for the bug, focus on:
 - Binder wiring: is the interface (`BnXxx`) implementation actually bound? Are callbacks/`linkToDeath` re-armed after the peer restarts? Are threadpool / oneway semantics correct?
 - Callback re-registration: after ignition/power-policy or a peer process restart, is the subscription re-established (a very common "stops updating after ON" root cause)?
 - Concurrency & lifetime: data races on shared state, missing locks, use-after-free of a `sp<>`/`wp<>`, callback fired after teardown.
-- Build/link: is the target in `Android.bp` with the right `shared_libs` (e.g. `libbinder`, `libutils`, `liblog`); is a new symbol actually exported?
+- Build/link: is the target in `Android.bp` with the right `shared_libs` (`libbinder_ndk` + `<iface>-V<N>-ndk` for vendor AIDL HALs — the same `<N>` the module already uses; `libbinder` only for system cpp-backend code; `libutils`, `liblog`); is a new symbol actually exported? No HIDL libs (`libhidlbase`, `libhwbinder`) in new code.
 - SELinux: would this need an sepolicy allow rule (new service, socket, or property access)? Note it — do not write the policy.
 
 Do NOT propose changes in Java/CarService, AIDL interface contracts, or VHAL vehicle-property internals — defer those to their specialists. Judge only the native-service side.
